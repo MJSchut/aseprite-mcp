@@ -8,7 +8,7 @@ It also includes a CLI (`aseprite-mcp build recipe.json`), so the same animation
 
 - **Built for how a model draws.** `draw` takes ASCII rows plus a color legend, shape tuples and dithered gradients. `read_pixels` returns the same grid format. `preview` returns a zoomed image with a pixel grid that the model can actually look at.
 - **Fast.** One persistent Aseprite worker process handles every call, so typical calls take **0.5–2 ms** (a cold `aseprite -b` start is ~70 ms per call). `batch` runs many steps with one open and one save.
-- **Cheap on context.** 14 tools totalling ~3.2k tokens of schema. Inputs and outputs are terse.
+- **Cheap on context.** 15 tools totalling ~3.6k tokens of schema. Inputs and outputs are terse.
 - **Art helpers.** Selective auto-outline, light-direction shading with hue-shifted shadows and highlights, palette ramps, palette extraction, quantize-to-palette with Bayer or Floyd–Steinberg dithering, mirroring, region copy, seamless tile shifting.
 - **Importing existing art.** Upscaled pixel art is detected and reduced to its native resolution. Hi-res art can be pixelated to a target size by majority color per block. `separate` splits the background from the subject (and fills the hole behind it) so only the subject animates.
 - **Animation framework.** 22 presets (`breathe`, `hop`, `hit`, `death`, `spin`, `sway`, `wave`, `cycle`, …), composable per-layer tracks with keyframes, waves and easing, secondary motion via per-layer lag, and RotSprite-smoothed rotation.
@@ -31,6 +31,7 @@ It also includes a CLI (`aseprite-mcp build recipe.json`), so the same animation
 | `resize` | Nearest-neighbor scale or canvas resize with anchor |
 | `export` | PNG/GIF/sequence, or sprite sheet + JSON (+ Godot / Bevy files) |
 | `animate` | Static art → tagged animations → sprite sheet, from inline args or a recipe file |
+| `ingest` | AI/video/hand-made frames → background removed, palette-locked, grid-snapped, aligned, tagged animation |
 | `batch` | Many steps in one call |
 | `run_lua` | Escape hatch: Aseprite Lua with `sprite` and `params` |
 
@@ -94,6 +95,27 @@ Existing single-layer art can be cut into parts and walked:
 - **Rig presets:** `idle_rig` (staggered breathing) and `walk_front` (alternating leg lifts, body bob and weight shift, opposite arm swing).
 - **Remapping:** use `parts` for other layer names, e.g. `{"name": "walk_front", "parts": {"head": "skull"}}`.
 - **Backfill:** `split` grows the remaining layer into the cut by `backfill` px (default 1), so a moving arm reveals torso, not a hole.
+
+## AI-generated frames → clean pixel art (`ingest`)
+
+Diffusion models, image editors and video models can produce new poses that procedural animation can't. Their output isn't pixel art yet: soft edges, noise, off-palette colors, backgrounds, drifting scale and position. `ingest` cleans it up:
+
+1. **Background removal.** Uses existing alpha, a given color, or auto-detected border colors, flood-filled with a Lab tolerance that also follows smooth gradients.
+2. **Palette.** Colors are pulled to the reference sprite's palette, a preset, or one extracted from the frames, at full resolution.
+3. **Pixel grid.** The image is reduced by majority color per block, which keeps edges crisp and introduces no blended colors.
+4. **Specks.** Orphan pixels are removed.
+5. **Alignment.**
+   - `sequence` uses one shared transform and keeps the source's own motion; use it for video.
+   - `feet` puts each frame's feet on the ground line and its center of mass on the reference anchor; use it for separately generated poses.
+
+Inputs: image files, a sprite sheet grid, or a video (`ffmpeg` required). Each call appends one tagged animation, so a character's `idle`, `walk` and `attack` all end up in one file:
+
+```json
+{ "path": "build/hero.aseprite", "frames": ["gen/walk_1.png", "gen/walk_2.png", "..."],
+  "reference": "art/hero.aseprite", "align": "feet", "tag": "walk", "durationMs": 100 }
+```
+
+Measured on synthetic diffusion-style frames (8× upscale, blurred edges, color noise and tint, gradient background), `ingest` recovers the original 64×64 frames at **~99% per-pixel accuracy** in about 0.5 s per 512px frame.
 
 ## Game engines
 

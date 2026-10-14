@@ -253,7 +253,7 @@ test("tool schemas avoid tuple-form items (rejected by the Claude API)", opts, a
   };
   for (const t of tools) walk(t.inputSchema, t.name);
   assert.deepEqual(bad, []);
-  assert.equal(tools.length, 14);
+  assert.equal(tools.length, 15);
 });
 
 test("split rigs a character into parts; walk_front lifts legs alternately", opts, async () => {
@@ -284,4 +284,43 @@ test("split rigs a character into parts; walk_front lifts legs alternately", opt
   assert.equal(await bottomRow("leg_r", 7), rest - 2, "right leg lifted on frame 7");
   const info = JSON.parse(text(await call("sprite_info", { path: out })));
   assert.deepEqual(info.tags, ["walk 1-8", "idle 9-16"]);
+});
+
+test("ingest cleans noisy upscaled frames on a background into pixel art", opts, async () => {
+  const truth = join(dir, "truth.aseprite");
+  await call("batch", {
+    path: truth,
+    steps: [
+      { op: "create_sprite", width: 16, height: 16 },
+      { op: "draw", shapes: [["rect", 4, 3, 11, 14, "#22122c", "#fff2c4"], ["rect", 6, 6, 9, 9, "#22122c", "#b0cfee"]] },
+    ],
+  });
+  // fake "AI output": 6x upscale, noise and tint, on a noisy light background, as numbered PNGs
+  await call("run_lua", {
+    path: truth, save: false, params: { dir },
+    code: `
+      local pc = app.pixelColor
+      math.randomseed(3)
+      local src = Image(sprite.width, sprite.height, ColorMode.RGB); src:drawSprite(sprite, 1)
+      for n = 1, 2 do
+        local out = Image(96, 96, ColorMode.RGB)
+        for y = 0, 95 do for x = 0, 95 do
+          local v = src:getPixel(x // 6, y // 6)
+          local r, g, b
+          if pc.rgbaA(v) == 0 then local c = 220 + math.random(-5, 5); r, g, b = c, c, c + 6
+          else r, g, b = pc.rgbaR(v) + 8 + math.random(-9, 9), pc.rgbaG(v) + math.random(-9, 9), pc.rgbaB(v) - 6 + math.random(-9, 9) end
+          out:drawPixel(x, y, pc.rgba(math.max(0, math.min(255, r)), math.max(0, math.min(255, g)), math.max(0, math.min(255, b)), 255))
+        end end
+        out:saveAs(params.dir .. "/ai_" .. n .. ".png")
+      end`,
+  });
+  const out = join(dir, "clean.aseprite");
+  const r = await call("ingest", {
+    path: out, frames: [join(dir, "ai_1.png"), join(dir, "ai_2.png")], reference: truth, tag: "idle",
+  });
+  assert.match(text(r), /"frames":2/);
+  const a = await grid(out, { frame: 2 });
+  const b = await grid(truth);
+  assert.deepEqual(a.rows, b.rows);
+  assert.deepEqual(new Set(Object.values(a.legend)), new Set(Object.values(b.legend)));
 });

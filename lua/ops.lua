@@ -180,6 +180,15 @@ local function openSprite(path)
   return sprite
 end
 
+-- Open an image as exactly that file (Aseprite would otherwise pull in numbered siblings: walk_1.png, walk_2.png...).
+local function openImage(path)
+  if not app.fs.isFile(path) then fail("file not found: " .. path) end
+  local ok, sprite = pcall(function() return Sprite { fromFile = path, oneFrame = true } end)
+  if not ok or not sprite then sprite = app.open(path) end
+  if not sprite then fail("could not open " .. path) end
+  return sprite
+end
+
 local function need(ctx)
   if not ctx.sprite then fail("no sprite open (missing or nonexistent 'path')") end
   return ctx.sprite
@@ -571,7 +580,8 @@ function ops.create_sprite(ctx, p)
   local scale = 1
   if p.from then
     -- Import an image (png/gif/...): undo pixel upscaling, or pixelate to a target size.
-    local src = openSprite(p.from)
+    local fext = app.fs.fileExtension(p.from):lower()
+    local src = (fext == "gif" or fext == "aseprite" or fext == "ase") and openSprite(p.from) or openImage(p.from)
     local first = renderRGB(src, 1)
     local fx, fy
     if p.width or p.height then
@@ -1802,6 +1812,331 @@ function ops.animate(ctx, p)
 end
 
 ---------------------------------------------------------------------------
+-- ingest: frames from any generator (diffusion, video, hand-made) -> clean pixel-art animation
+---------------------------------------------------------------------------
+
+local function labCache()
+  local cache = {}
+  return function(r, g, b)
+    local k = r * 65536 + g * 256 + b
+    local e = cache[k]
+    if not e then e = { rgb2lab(r, g, b) }; cache[k] = e end
+    return e
+  end
+end
+
+local function dE(a, b) return math.sqrt((a[1] - b[1]) ^ 2 + (a[2] - b[2]) ^ 2 + (a[3] - b[3]) ^ 2) end
+
+-- Shrink huge inputs (AI images are often 1024px+) with smoothing; the result is still >= 4x the art.
+local function preShrink(img, maxDim)
+  local m = max(img.width, img.height)
+  if m <= maxDim then return img end
+  local f = maxDim / m
+  local out = img:clone()
+  local ok = pcall(function() out:resize { width = round(img.width * f), height = round(img.height * f), method = "bilinear" } end)
+  if not ok then out = img:clone(); out:resize { width = round(img.width * f), height = round(img.height * f) } end
+  return out
+end
+
+-- Make the background transparent: existing alpha, a given color, or auto (border color clusters),
+-- flood-filled from the borders with a Lab tolerance; also follows smooth gradients.
+local function removeBackground(img, mode, tol, tolGrad)
+  local w, h = img.width, img.height
+  local lab = labCache()
+  local border, clearBorder = {}, 0
+  local function bpx(x, y)
+    local v = img:getPixel(x, y)
+    if pc.rgbaA(v) < 128 then clearBorder = clearBorder + 1 else border[#border + 1] = v end
+  end
+  for x = 0, w - 1 do bpx(x, 0); bpx(x, h - 1) end
+  for y = 1, h - 2 do bpx(0, y); bpx(w - 1, y) end
+  if mode == "none" or clearBorder > (2 * (w + h)) * 0.5 then
+    for it in img:pixels() do if pc.rgbaA(it()) < 128 then it(0) end end
+    return
+  end
+  local keys = {}
+  if mode ~= nil and mode ~= "auto" then
+    local r, g, b = parseRGBA(mode)
+    keys[1] = { rgb2lab(r, g, b) }
+  else
+    local clusters = {}
+    for _, v in ipairs(border) do
+      local c = lab(pc.rgbaR(v), pc.rgbaG(v), pc.rgbaB(v))
+      local hit
+      for _, k in ipairs(clusters) do if dE(k.c, c) < tol then hit = k; break end end
+      if hit then hit.n = hit.n + 1 elseif #clusters < 6 then clusters[#clusters + 1] = { c = c, n = 1 } end
+    end
+    for _, k in ipairs(clusters) do if k.n >= #border * 0.08 then keys[#keys + 1] = k.c end end
+  end
+  local function nearKey(c)
+    for _, k in ipairs(keys) do if dE(k, c) < tol then return true end end
+    return false
+  end
+  local seen = {}
+  local stack = {}
+  local function push(x, y, from)
+    stack[#stack + 1] = x; stack[#stack + 1] = y; stack[#stack + 1] = from or false
+  end
+  for x = 0, w - 1 do push(x, 0); push(x, h - 1) end
+  for y = 0, h - 1 do push(0, y); push(w - 1, y) end
+  while #stack > 0 do
+    local from = table.remove(stack); local y = table.remove(stack); local x = table.remove(stack)
+    if x >= 0 and y >= 0 and x < w and y < h then
+      local k = y * w + x
+      if not seen[k] then
+        local v = img:getPixel(x, y)
+        local c = lab(pc.rgbaR(v), pc.rgbaG(v), pc.rgbaB(v))
+        if pc.rgbaA(v) < 128 or nearKey(c) or (from and dE(from, c) < tolGrad) then
+          seen[k] = true
+          img:drawPixel(x, y, 0)
+          push(x + 1, y, c); push(x - 1, y, c); push(x, y + 1, c); push(x, y - 1, c)
+        end
+      end
+    end
+  end
+  for it in img:pixels() do if pc.rgbaA(it()) < 128 then it(0) end end
+end
+
+-- Remove opaque specks (8-connected components smaller than minSize).
+local function removeSpecks(img, minSize)
+  if minSize <= 1 then return 0 end
+  local w, h = img.width, img.height
+  local seen, removed = {}, 0
+  for y0 = 0, h - 1 do
+    for x0 = 0, w - 1 do
+      local k0 = y0 * w + x0
+      if not seen[k0] and pc.rgbaA(img:getPixel(x0, y0)) > 0 then
+        local comp, stack = {}, { k0 }
+        seen[k0] = true
+        while #stack > 0 do
+          local k = table.remove(stack)
+          comp[#comp + 1] = k
+          local x, y = k % w, k // w
+          for dy = -1, 1 do
+            for dx = -1, 1 do
+              local nx, ny = x + dx, y + dy
+              if nx >= 0 and ny >= 0 and nx < w and ny < h then
+                local nk = ny * w + nx
+                if not seen[nk] and pc.rgbaA(img:getPixel(nx, ny)) > 0 then seen[nk] = true; stack[#stack + 1] = nk end
+              end
+            end
+          end
+        end
+        if #comp < minSize then
+          for _, k in ipairs(comp) do img:drawPixel(k % w, k // w, 0) end
+          removed = removed + #comp
+        end
+      end
+    end
+  end
+  return removed
+end
+
+-- Block-majority downsample of a palette-quantized RGBA image. Transparent counts as a color.
+local function downsample(src, ox, oy, s, ow, oh)
+  local out = Image(ow, oh, ColorMode.RGB)
+  for j = 0, oh - 1 do
+    local y0, y1 = floor(oy + j * s), floor(oy + (j + 1) * s) - 1
+    for i = 0, ow - 1 do
+      local x0, x1 = floor(ox + i * s), floor(ox + (i + 1) * s) - 1
+      if x1 < x0 then x1 = x0 end
+      if y1 < y0 then y1 = y0 end
+      local counts, best, bestN = {}, 0, 0
+      for y = max(0, y0), min(src.height - 1, y1) do
+        for x = max(0, x0), min(src.width - 1, x1) do
+          local v = src:getPixel(x, y)
+          local n = (counts[v] or 0) + 1
+          counts[v] = n
+          if n > bestN then best, bestN = v, n end
+        end
+      end
+      out:drawPixel(i, j, best)
+    end
+  end
+  return out
+end
+
+local function opaqueStats(img)
+  local bb = img:shrinkBounds()
+  local sx, n = 0, 0
+  for it in img:pixels() do
+    if pc.rgbaA(it()) > 0 then sx = sx + it.x; n = n + 1 end
+  end
+  -- center of mass in pixel-center coordinates (x + 0.5), comparable with bbox edges
+  return bb, n > 0 and sx / n + 0.5 or img.width / 2
+end
+
+-- p: { frames=[paths] | sheet={path,cols,rows,count?}, reference?, palette (hex list | "reference" | {extract=n}),
+--      height?, scale?, background?, tolerance?, align? ("sequence"|"feet"|"center"), canvas?, padding?,
+--      tag?, durationMs?, layer?, minSpeck? }
+function ops.ingest(ctx, p)
+  -- 1. load source frames
+  local sources = {}
+  if p.sheet then
+    local sh = openImage(p.sheet.path)
+    local full = renderRGB(sh, 1)
+    sh:close()
+    local cols, rows = p.sheet.cols or 1, p.sheet.rows or 1
+    local cw, chh = full.width // cols, full.height // rows
+    for r = 0, rows - 1 do
+      for c = 0, cols - 1 do
+        if not p.sheet.count or #sources < p.sheet.count then
+          sources[#sources + 1] = Image(full, Rectangle(c * cw, r * chh, cw, chh))
+        end
+      end
+    end
+  else
+    for _, path in ipairs(p.frames or {}) do
+      local ext = app.fs.fileExtension(path):lower()
+      local s = (ext == "gif" or ext == "aseprite" or ext == "ase") and openSprite(path) or openImage(path)
+      for f = 1, #s.frames do sources[#sources + 1] = renderRGB(s, f) end
+      s:close()
+    end
+  end
+  if #sources == 0 then fail("no input frames") end
+
+  -- 2. background removal + content bounds at (shrunk) full resolution
+  local tol = p.tolerance or 12
+  local items = {}
+  for i, img in ipairs(sources) do
+    local work = preShrink(img, p.workSize or 512)
+    removeBackground(work, p.background, tol, p.gradientTolerance or 3)
+    removeSpecks(work, 4)
+    local bb = work:shrinkBounds()
+    if bb.width == 0 then fail("frame " .. i .. ": nothing left after background removal (try background='none' or a lower tolerance)") end
+    items[i] = { img = work, bb = bb }
+  end
+
+  -- 3. reference: palette, target height, canvas, anchor
+  local ref, refBB, refCx
+  if p.reference then
+    ref = openSprite(p.reference)
+    local imgs = {}
+    for f = 1, #ref.frames do imgs[#imgs + 1] = renderRGB(ref, f) end
+    for _, im in ipairs(imgs) do
+      local bb = im:shrinkBounds()
+      if bb.width > 0 then refBB = refBB and refBB:union(bb) or Rectangle(bb) end
+    end
+    local _, cx = opaqueStats(imgs[1])
+    refCx = cx
+    if p.palette == "reference" or p.palette == nil then p.palette = extractPalette(colorHistogram(imgs), p.maxColors or 32) end
+  end
+  local colors = p.palette
+  if type(colors) ~= "string" and colors ~= nil and colors.extract then
+    colors = extractPalette(colorHistogram((function()
+      local l = {}
+      for _, it in ipairs(items) do l[#l + 1] = it.img end
+      return l
+    end)()), colors.extract)
+  end
+  if colors == nil or colors == "reference" then fail("palette needed: hex list, preset, {extract=n} or a reference sprite") end
+  local match = makeMatcher(colors)
+
+  -- 4. scale: source px per art px
+  local maxH, union = 0, nil
+  for _, it in ipairs(items) do
+    maxH = max(maxH, it.bb.height)
+    union = union and union:union(it.bb) or Rectangle(it.bb)
+  end
+  local s = p.scale
+  if not s then
+    local targetH = p.height or (refBB and refBB.height) or fail("give height, scale or a reference sprite")
+    s = maxH / targetH
+  end
+  if s < 1 then s = 1 end
+
+  -- 5. quantize at full res, downsample by block majority
+  local align = p.align or "sequence"
+  local frames = {}
+  for i, it in ipairs(items) do
+    local q = it.img
+    local cache = {}
+    for px in q:pixels() do
+      local v = px()
+      if pc.rgbaA(v) > 0 then
+        local m = cache[v]
+        if not m then
+          local r, g, b = match(pc.rgbaR(v), pc.rgbaG(v), pc.rgbaB(v))
+          m = pc.rgba(r, g, b, 255)
+          cache[v] = m
+        end
+        px(m)
+      end
+    end
+    local ox, oy, bw, bh
+    if align == "sequence" then
+      ox, oy, bw, bh = union.x, union.y, union.width, union.height
+    else
+      ox, oy, bw, bh = it.bb.x, it.bb.y, it.bb.width, it.bb.height
+    end
+    local ow, oh = math.ceil(bw / s), math.ceil(bh / s)
+    -- anchor the block grid at the bottom so feet land on whole pixels
+    oy = oy + bh - oh * s
+    local small = downsample(q, ox, oy, s, ow, oh)
+    removeSpecks(small, p.minSpeck or 2)
+    frames[i] = small
+  end
+
+  -- 6. canvas + placement
+  local pad = p.padding or 2
+  local maxW, maxOH = 0, 0
+  for _, f in ipairs(frames) do maxW = max(maxW, f.width); maxOH = max(maxOH, f.height) end
+  local cw, chh
+  if p.canvas then cw, chh = p.canvas[1], p.canvas[2]
+  elseif ref then cw, chh = ref.width, ref.height
+  else cw, chh = maxW + 2 * pad, maxOH + 2 * pad end
+  local anchorX = refCx or cw / 2
+  local anchorY = refBB and (refBB.y + refBB.height) or (chh - pad)
+  if ref then ref:close() end
+
+  local sprite = ctx.sprite
+  local layer
+  local firstNew
+  if not sprite then
+    sprite = Sprite(cw, chh, ColorMode.RGB)
+    sprite.layers[1].name = p.layer or "art"
+    layer = sprite.layers[1]
+    firstNew = 1
+    ctx.sprite = sprite
+  else
+    layer = nil
+    for _, e in ipairs(imageLayers(sprite)) do if e.layer.name == (p.layer or "art") then layer = e.layer end end
+    if not layer then layer = sprite:newLayer(); layer.name = p.layer or "art" end
+    firstNew = #sprite.frames + 1
+  end
+  applyPalette(sprite, colors)
+  -- appending frames would stretch a tag that ends on the last frame; remember and restore ranges
+  local oldTags = {}
+  for _, t in ipairs(sprite.tags) do oldTags[#oldTags + 1] = { t, t.toFrame.frameNumber } end
+  local seqRef
+  for i, f in ipairs(frames) do
+    local fr = (i == 1 and firstNew == 1) and sprite.frames[1] or sprite:newEmptyFrame(#sprite.frames + 1)
+    fr.duration = (p.durationMs or 100) / 1000
+    local bb, cx = opaqueStats(f)
+    local x, y
+    if align == "sequence" then
+      -- one shared transform keeps the source's own motion; anchor the first frame like "feet"
+      if not seqRef then
+        seqRef = { round(anchorX - cx), round(anchorY - (bb.y + bb.height)) }
+      end
+      x, y = seqRef[1], seqRef[2]
+    elseif align == "center" then
+      x, y = round(cw / 2 - (bb.x + bb.width / 2)), round(chh / 2 - (bb.y + bb.height / 2))
+    else -- feet: bottom on the ground line, horizontal center of mass on the anchor
+      x, y = round(anchorX - cx), round(anchorY - (bb.y + bb.height))
+    end
+    sprite:newCel(layer, fr, f, Point(x, y))
+  end
+  for _, ot in ipairs(oldTags) do pcall(function() ot[1].toFrame = sprite.frames[ot[2]] end) end
+  if p.tag then
+    local t = sprite:newTag(firstNew, #sprite.frames)
+    t.name = p.tag
+  end
+  return { frames = #frames, size = sprite.width .. "x" .. sprite.height, scale = floor(s * 100 + 0.5) / 100,
+    colors = #colors, tag = p.tag }
+end
+
+---------------------------------------------------------------------------
 -- Runner
 ---------------------------------------------------------------------------
 
@@ -1816,7 +2151,8 @@ local function run(req)
   if ctx.path and steps[1].op ~= "create_sprite" and app.fs.isFile(ctx.path) then
     ctx.sprite = openSprite(ctx.path)
     ctx.opened = ctx.path
-  elseif ctx.path and steps[1].op ~= "create_sprite" and steps[1].op ~= "run_lua" and steps[1].op ~= "palette" then
+  elseif ctx.path and steps[1].op ~= "create_sprite" and steps[1].op ~= "run_lua" and steps[1].op ~= "palette"
+    and steps[1].op ~= "ingest" then
     fail("file not found: " .. ctx.path)
   end
   local results, dirty = {}, false

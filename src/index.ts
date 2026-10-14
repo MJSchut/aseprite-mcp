@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 import { watch } from "node:fs";
+import { execFile } from "node:child_process";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -46,6 +51,27 @@ if (process.argv[2] === "build") {
   await startServer();
 }
 
+/** Extract video frames to PNGs with ffmpeg (fps default 12). */
+async function extractVideoFrames(
+  file: string,
+  dir: string,
+  o: { fps?: number; start?: number; duration?: number },
+): Promise<string[]> {
+  const args = ["-loglevel", "error"];
+  if (o.start) args.push("-ss", String(o.start));
+  args.push("-i", file);
+  if (o.duration) args.push("-t", String(o.duration));
+  args.push("-vf", `fps=${o.fps ?? 12}`, join(dir, "f%04d.png"));
+  try {
+    await promisify(execFile)(process.env.FFMPEG_PATH ?? "ffmpeg", args);
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    if (err.code === "ENOENT") throw new Error("video input needs ffmpeg (brew install ffmpeg, or set FFMPEG_PATH)");
+    throw e;
+  }
+  return (await readdir(dir)).filter((f) => f.endsWith(".png")).sort().map((f) => join(dir, f));
+}
+
 // ---------------------------------------------------------------------------
 // MCP server
 // ---------------------------------------------------------------------------
@@ -78,6 +104,16 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
       if (typeof s.from === "string") s.from = resolvePath(s.from);
     }
     if (s.op === "palette" && s.colors !== undefined) s.colors = resolvePalette(s.colors);
+    if (s.op === "ingest") {
+      if (Array.isArray(s.frames)) s.frames = (s.frames as string[]).map((f) => resolvePath(f));
+      if (s.sheet && typeof s.sheet === "object") {
+        const sh = s.sheet as { path: string };
+        s.sheet = { ...sh, path: resolvePath(sh.path) };
+      }
+      if (typeof s.reference === "string") s.reference = resolvePath(s.reference);
+      if (typeof s.palette === "string" && s.palette !== "reference") s.palette = resolvePalette(s.palette);
+      if (Array.isArray(s.palette)) s.palette = resolvePalette(s.palette);
+    }
     if (s.op === "edit" && s.action === "quantize" && s.palette !== "sprite" && s.palette !== undefined)
       s.palette = resolvePalette(s.palette);
     return s;
@@ -357,8 +393,55 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
     },
   );
 
+  server.registerTool(
+    "ingest",
+    {
+      description:
+        "Turn frames from anything (diffusion/image models, video, hand-drawn) into clean pixel-art animation: removes background, " +
+        "pulls colors to a palette, snaps to the pixel grid (block majority), drops specks, aligns frames, adds a tag. " +
+        "Appends to path if it exists (one tag per call). Source: frames (image paths, gif ok) | sheet{path,cols,rows,count?} | video{path,fps?,start?,duration?} (needs ffmpeg). " +
+        "Size: height (art px) | scale (source px per art px) | reference sprite (matches its height, palette, canvas, feet). " +
+        "align: sequence (shared transform, keeps source motion; video) | feet (per frame: independent poses) | center.",
+      inputSchema: {
+        path,
+        frames: z.array(z.string()).optional(),
+        sheet: z.object({ path: z.string(), cols: int, rows: int, count: int.optional() }).optional(),
+        video: z.object({ path: z.string(), fps: int.optional(), start: int.optional(), duration: int.optional() }).optional(),
+        reference: z.string().optional(),
+        palette: z.union([z.array(color), z.string(), z.object({ extract: int })]).optional()
+          .describe('hex list | preset | "reference" | {extract:n}'),
+        height: int.optional(),
+        scale: int.optional(),
+        background: z.string().optional().describe('"auto" (default) | "none" | color'),
+        tolerance: int.optional().describe("background Lab tolerance, default 12"),
+        align: z.enum(["sequence", "feet", "center"]).optional(),
+        canvas: z.array(int).optional().describe("[w,h]"),
+        tag: z.string().optional(),
+        durationMs: int.optional(),
+        layer: z.string().optional(),
+        preview,
+      },
+    },
+    async ({ path: file, video, preview: pv, ...args }) => {
+      let tmp: string | undefined;
+      try {
+        let frames = args.frames;
+        if (video) {
+          tmp = await mkdtemp(join(tmpdir(), "aseprite-mcp-video-"));
+          frames = await extractVideoFrames(resolvePath(video.path), tmp, video);
+        }
+        return await run(file, [{ op: "ingest", ...args, frames }], pv ? { tag: args.tag } : false);
+      } catch (e) {
+        return errorResult(e);
+      } finally {
+        if (tmp) await rm(tmp, { recursive: true, force: true });
+      }
+    },
+  );
+
   const BATCH_OPS = [
-    "create_sprite", "sprite_info", "draw", "edit", "palette", "read_pixels", "layer", "frames", "resize", "animate", "run_lua",
+    "create_sprite", "sprite_info", "draw", "edit", "palette", "read_pixels", "layer", "frames", "resize", "animate", "ingest",
+    "run_lua",
   ] as const;
 
   server.registerTool(
