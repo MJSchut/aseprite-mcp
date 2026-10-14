@@ -141,7 +141,59 @@ const PRESETS: Record<string, { help: string; make: (a: number, o: PresetOpts) =
   },
 };
 
-const DEFAULT_AMOUNT: Record<string, number> = { float: 2, hop: 6, hit: 2, sway: 0.15, swing: 15, death: 2 };
+// ---------------------------------------------------------------------------
+// Rig presets: characters cut into part layers (edit split). Default layer names below;
+// remap with options.parts, e.g. {"head":"skull"}. Parts a character lacks are simply skipped.
+// ---------------------------------------------------------------------------
+
+const PART_NAMES = ["head", "torso", "arm_l", "arm_r", "leg_l", "leg_r"] as const;
+type Part = (typeof PART_NAMES)[number];
+
+function partsOf(o: PresetOpts): Record<Part, string> {
+  const map = (o.parts ?? {}) as Partial<Record<Part, string>>;
+  return Object.fromEntries(PART_NAMES.map((p) => [p, map[p] ?? p])) as Record<Part, string>;
+}
+
+const round = (v: number) => Math.round(v);
+
+Object.assign(PRESETS, {
+  idle_rig: {
+    help: "rigged idle: torso breathes, head and arms follow 1-2 frames later (amount px, 1)",
+    make: (a: number, o: PresetOpts): PresetResult => {
+      const p = partsOf(o);
+      const breath = [0, 0, 1, 1, 1, 1, 0, 0].map((v) => round(v * a));
+      const lag = (n: number) => breath.map((_, i) => breath[(i - n + 8) % 8]);
+      return {
+        frames: 8, durationMs: 140, tracks: [
+          { layer: p.torso, y: { seq: breath } },
+          { layer: p.head, y: { seq: lag(1) } },
+          { layer: [p.arm_l, p.arm_r], y: { seq: lag(2) } },
+        ],
+      };
+    },
+  },
+  walk_front: {
+    help: "rigged front-facing walk: alternating leg lifts, body bob + weight shift, opposite arm swing (amount = lift px, 2)",
+    make: (a: number, o: PresetOpts): PresetResult => {
+      const p = partsOf(o);
+      const lift = [0, -a / 2, -a, -a / 2, 0, 0, 0, 0].map(round);
+      const half = (s: number[]) => s.map((_, i) => s[(i + 4) % 8]);
+      const body = [p.torso, p.arm_l, p.arm_r, p.head];
+      return {
+        frames: 8, durationMs: 100, tracks: [
+          { layer: p.leg_l, y: { seq: lift } },
+          { layer: p.leg_r, y: { seq: half(lift) } },
+          { layer: body, y: { seq: [1, 0, 0, 0, 1, 0, 0, 0] }, x: { seq: [0, 0, 1, 0, 0, 0, -1, 0] } },
+          { layer: p.head, y: { seq: [0, 1, 0, 0, 0, 1, 0, 0] } },
+          { layer: p.arm_l, y: { seq: [0, 0, 0, 0, 0, -1, -1, 0] } },
+          { layer: p.arm_r, y: { seq: [0, -1, -1, 0, 0, 0, 0, 0] } },
+        ],
+      };
+    },
+  },
+});
+
+const DEFAULT_AMOUNT: Record<string, number> = { float: 2, hop: 6, hit: 2, sway: 0.15, swing: 15, death: 2, walk_front: 2 };
 
 export const PRESET_HELP = Object.entries(PRESETS)
   .map(([k, v]) => `${k}: ${v.help}`)
@@ -163,7 +215,7 @@ export function expandAnimation(anim: Animation): Record<string, unknown> {
       const layers = o.layers;
       const lag = o.lag ?? {};
       const lagged = Object.keys(lag);
-      tracks.push({ ...t, layer: layers ?? "*", ...(lagged.length ? { exclude: lagged } : {}) });
+      tracks.push({ ...t, layer: layers ?? t.layer ?? "*", ...(lagged.length ? { exclude: lagged } : {}) });
       // secondary motion: lagged layers follow the same motion, delayed
       for (const [layer, delay] of Object.entries(lag)) tracks.push({ ...t, layer, timeOffset: -delay });
     }

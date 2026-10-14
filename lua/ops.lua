@@ -1140,6 +1140,81 @@ function edit.separate(ctx, p)
   return { moved = n, colors = hexes }
 end
 
+-- Cut a region (rects and/or a char mask) out of a layer onto its own layer: rig a sprite into parts.
+-- backfill grows the remaining pixels n px into the cut so moving parts don't reveal holes.
+function edit.split(ctx, p)
+  local sprite = need(ctx)
+  local layer = resolveLayer(sprite, p.layer)
+  local frame = resolveFrame(sprite, p.frame)
+  local cel, img = editableImage(sprite, layer, frame)
+  local codec = makeCodec(sprite)
+  local w, h = img.width, img.height
+  local region = {}
+  for _, r in ipairs(p.rects or {}) do
+    for y = max(0, min(r[2], r[4])), min(h - 1, max(r[2], r[4])) do
+      for x = max(0, min(r[1], r[3])), min(w - 1, max(r[1], r[3])) do region[y * w + x] = true end
+    end
+  end
+  if p.rows then
+    local ox, oy = p.x or 0, p.y or 0
+    for row, line in ipairs(p.rows) do
+      for col = 1, #line do
+        local ch = line:sub(col, col)
+        local x, y = ox + col - 1, oy + row - 1
+        if ch ~= "." and ch ~= " " and inb(img, x, y) then region[y * w + x] = true end
+      end
+    end
+  end
+  local part = Image(sprite.spec)
+  local moved, n = {}, 0
+  for k in pairs(region) do
+    local x, y = k % w, k // w
+    local v = img:getPixel(x, y)
+    if not codec.clear(v) then
+      part:drawPixel(x, y, v)
+      img:drawPixel(x, y, codec.none)
+      moved[k] = true; n = n + 1
+    end
+  end
+  for _ = 1, p.backfill or 1 do
+    local updates = {}
+    for k in pairs(moved) do
+      local x, y = k % w, k // w
+      if codec.clear(img:getPixel(x, y)) then
+        local counts, best, bestN = {}, nil, 0
+        for _, d in ipairs({ { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }) do
+          local nx, ny = x + d[1], y + d[2]
+          if inb(img, nx, ny) then
+            local v = img:getPixel(nx, ny)
+            if not codec.clear(v) then
+              local c = (counts[v] or 0) + 1
+              counts[v] = c
+              if c > bestN then best, bestN = v, c end
+            end
+          end
+        end
+        if best and bestN >= (p.backfillMin or 2) then updates[#updates + 1] = { x, y, best } end
+      end
+    end
+    for _, u in ipairs(updates) do img:drawPixel(u[1], u[2], u[3]) end
+  end
+  commit(cel, img)
+  local target
+  for _, e in ipairs(allLayers(sprite.layers)) do if e.layer.name == p.toLayer then target = e.layer end end
+  if target then
+    local tcel, timg = editableImage(sprite, target, frame)
+    timg:drawImage(part, Point(0, 0))
+    commit(tcel, timg)
+  else
+    target = sprite:newLayer()
+    target.name = p.toLayer or "part"
+    target.parent = layer.parent
+    target.stackIndex = p.below and layer.stackIndex or layer.stackIndex + 1
+    sprite:newCel(target, frame, part, Point(0, 0))
+  end
+  return { moved = n, layers = layerNames(sprite) }
+end
+
 function ops.edit(ctx, p)
   local fn = edit[p.action]
   if not fn then fail("unknown edit action " .. tostring(p.action)) end
@@ -1704,7 +1779,11 @@ function ops.animate(ctx, p)
       for li, e in ipairs(layers) do
         local tf = composeTransform(tracks, e.layer.name, e.path, t, i, loop)
         local img = renderLayer(rest(li, sf), tf, pivot, cb, sprite, codec)
-        if img and not img:isEmpty() then sprite:newCel(e.layer, fr, img, Point(0, 0)) end
+        if img and not img:isEmpty() then
+          -- store trimmed cels: smaller files, faster saves and exports
+          local bb = img:shrinkBounds()
+          sprite:newCel(e.layer, fr, Image(img, bb), Point(bb.x, bb.y))
+        end
       end
     end
     -- tags are created at the end: appending frames would otherwise grow the previous tag

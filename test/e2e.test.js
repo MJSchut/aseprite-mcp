@@ -255,3 +255,33 @@ test("tool schemas avoid tuple-form items (rejected by the Claude API)", opts, a
   assert.deepEqual(bad, []);
   assert.equal(tools.length, 14);
 });
+
+test("split rigs a character into parts; walk_front lifts legs alternately", opts, async () => {
+  const f = join(dir, "rig.aseprite");
+  const r = await call("batch", {
+    path: f,
+    steps: [
+      { op: "create_sprite", width: 12, height: 16, layerName: "torso" },
+      { op: "draw", shapes: [["rect", 3, 1, 8, 6, "#000", "#fff"], ["rect", 3, 7, 8, 11, "#000", "#ccc"], ["rect", 3, 12, 5, 15, "#000", "#888"], ["rect", 6, 12, 8, 15, "#000", "#888"]] },
+      { op: "edit", action: "split", layer: "torso", toLayer: "leg_l", below: true, rects: [[0, 12, 5, 15]] },
+      { op: "edit", action: "split", layer: "torso", toLayer: "leg_r", below: true, rects: [[6, 12, 11, 15]] },
+      { op: "edit", action: "split", layer: "torso", toLayer: "head", rects: [[0, 0, 11, 6]], backfill: 0 },
+    ],
+  });
+  assert.match(text(r).split("\n")[4], /"layers":\["leg_l","leg_r","torso","head"\]/);
+  const out = join(dir, "rig_anim.aseprite");
+  await call("animate", {
+    source: f, output: out, padding: [0, 2, 0, 1], preview: false,
+    animations: [{ name: "walk", preset: "walk_front" }, { name: "idle", preset: "idle_rig" }],
+  });
+  const bottomRow = async (layer, frame) => {
+    const { rows } = await grid(out, { layer, frame });
+    return rows.findLastIndex((row) => row.replace(/\./g, "") !== "");
+  };
+  const rest = await bottomRow("leg_l", 1);
+  assert.equal(await bottomRow("leg_l", 3), rest - 2, "left leg lifted on frame 3");
+  assert.equal(await bottomRow("leg_r", 3), rest, "right leg planted on frame 3");
+  assert.equal(await bottomRow("leg_r", 7), rest - 2, "right leg lifted on frame 7");
+  const info = JSON.parse(text(await call("sprite_info", { path: out })));
+  assert.deepEqual(info.tags, ["walk 1-8", "idle 9-16"]);
+});

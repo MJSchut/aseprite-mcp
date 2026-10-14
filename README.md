@@ -11,7 +11,7 @@ It also includes a CLI (`aseprite-mcp build recipe.json`), so the same animation
 - **Cheap on context.** 14 tools totalling ~3.2k tokens of schema. Inputs and outputs are terse.
 - **Art helpers.** Selective auto-outline, light-direction shading with hue-shifted shadows and highlights, palette ramps, palette extraction, quantize-to-palette with Bayer or Floyd–Steinberg dithering, mirroring, region copy, seamless tile shifting.
 - **Importing existing art.** Upscaled pixel art is detected and reduced to its native resolution. Hi-res art can be pixelated to a target size by majority color per block. `separate` splits the background from the subject (and fills the hole behind it) so only the subject animates.
-- **Animation framework.** 20 presets (`breathe`, `hop`, `hit`, `death`, `spin`, `sway`, `wave`, `cycle`, …), composable per-layer tracks with keyframes, waves and easing, secondary motion via per-layer lag, and RotSprite-smoothed rotation.
+- **Animation framework.** 22 presets (`breathe`, `hop`, `hit`, `death`, `spin`, `sway`, `wave`, `cycle`, …), composable per-layer tracks with keyframes, waves and easing, secondary motion via per-layer lag, and RotSprite-smoothed rotation.
 - **Game export.** Sprite sheet + Aseprite JSON (frame tags), plus a **Godot 4 `SpriteFrames` `.tres`** and a **Bevy-friendly atlas JSON**.
 - **Safe with your assets.** It refuses to overwrite existing non-`.aseprite` images. You import them, edit the import, then export.
 
@@ -22,7 +22,7 @@ It also includes a CLI (`aseprite-mcp build recipe.json`), so the same animation
 | `create_sprite` | New sprite, or import an image (`from`) with auto native-resolution detection or pixelation to `width`/`height` |
 | `sprite_info` | Size, mode, layers, frame durations, tags (palette on request) |
 | `draw` | `shapes` (`line`/`rect`/`ellipse` with fill, dithered `gradient`), `rows` + `legend`, `pixels` |
-| `edit` | `fill`, `replace`, `mirror`, `outline`, `shade`, `copy`, `shift`, `quantize`, `separate` |
+| `edit` | `fill`, `replace`, `mirror`, `outline`, `shade`, `copy`, `shift`, `quantize`, `separate`, `split` |
 | `palette` | Extract dominant colors (from a sprite or any image), generate hue-shifted ramps, set the palette |
 | `read_pixels` | Pixels → character grid + legend |
 | `preview` | Rendered PNG the model can see; frames, contact sheet, or one row per animation tag |
@@ -74,6 +74,26 @@ From the MCP side, `animate` with `saveRecipe` writes this file for you, with pa
 - `{ "wave": "sine" | "triangle" | "square" | "saw", "amp", "base", "phase", "cycles" }`.
 
 Tip: draw parts (body, head, eyes, cape) on separate layers. Then `lag` and per-layer tracks give much livelier motion than moving the whole sprite.
+
+### Rigging existing art (idle and walk from one static image)
+
+Existing single-layer art can be cut into parts and walked:
+
+1. `create_sprite` with `from` imports the art at native resolution.
+2. `edit separate` takes off the background.
+3. `edit split` cuts the parts onto layers named `head`, `torso`, `arm_l`, `arm_r`, `leg_l` and `leg_r`. Put legs `below` the torso.
+4. Animate with the rig presets:
+
+```json
+[{ "op": "edit", "action": "split", "layer": "art", "toLayer": "leg_l", "below": true, "rects": [[0, 51, 30, 63]] },
+ { "op": "edit", "action": "split", "layer": "art", "toLayer": "leg_r", "below": true, "rects": [[31, 51, 63, 63]] },
+ { "op": "edit", "action": "split", "layer": "art", "toLayer": "arm_l", "rects": [[14, 36, 23, 43], [14, 44, 22, 49]] },
+ { "op": "edit", "action": "split", "layer": "art", "toLayer": "head", "rects": [[0, 0, 63, 31]], "backfill": 0 }]
+```
+
+- **Rig presets:** `idle_rig` (staggered breathing) and `walk_front` (alternating leg lifts, body bob and weight shift, opposite arm swing).
+- **Remapping:** use `parts` for other layer names, e.g. `{"name": "walk_front", "parts": {"head": "skull"}}`.
+- **Backfill:** `split` grows the remaining layer into the cut by `backfill` px (default 1), so a moving arm reveals torso, not a hole.
 
 ## Game engines
 

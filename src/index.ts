@@ -171,11 +171,12 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
         'outline{color?="auto" (darker hue-shifted neighbor), mode?:outside|inside, corners?} | ' +
         "shade{light?:top_left|top|...|bottom_right, depth?, highlightDepth?, shadow?/highlight?: color|\"auto\"|false, ignore?: colors (e.g. outline), strength?} | " +
         "copy{x,y,width,height,toX,toY,fromLayer?,fromFrame?,flip?:h|v} | shift{dx,dy,wrap?} | " +
+        "split{toLayer, rects?:[[x1,y1,x2,y2]], rows?(mask, x,y), below?, backfill?=1} (cut a part onto its own layer for rigging: head, torso, arm_l, arm_r, leg_l, leg_r) | " +
         "separate{colors?(default: border colors), seeds?:[[x,y]], toLayer?=\"background\"|false, islands?=6, fillHole?=true} (split background from subject) | " +
         'quantize{palette?: hex list|preset|"sprite", dither?:none|bayer|fs, strength? 0-1, setPalette?} (pull colors to a palette)',
       inputSchema: z.looseObject({
         path,
-        action: z.enum(["fill", "replace", "mirror", "outline", "shade", "copy", "shift", "quantize", "separate"]),
+        action: z.enum(["fill", "replace", "mirror", "outline", "shade", "copy", "shift", "quantize", "separate", "split"]),
         layer,
         frame,
         preview,
@@ -320,7 +321,7 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
       description:
         "Static art -> animations. Reads `source` (never modified), writes `output` .aseprite with one tag per animation, " +
         "optionally exports a sheet. Each animation: {name, preset?, frames?, durationMs?, loop?, pivot?:bottom|center|top|[x,y], sourceFrames?|sourceTag?, tracks?}. " +
-        "preset: name | {name, amount?, layers?, lag?:{layer:0.1}, color?, colors?} | list (combined). " +
+        "preset: name | {name, amount?, layers?, lag?:{layer:0.1}, color?, colors?, parts?:{head:\"skull\"}} | list (combined). " +
         `Presets: ${PRESET_HELP}. ` +
         "tracks: [{layer?:\"*\"|name, x,y,sxPx,syPx,sx,sy,rot,shear,waveAmp,alpha,flash,dissolve,visible: curve}] " +
         "curve = number | {seq:[per frame]} | {keys:[[t,v,ease?]]} (ease in|out|inout|step|back) | {wave:sine|triangle|square|saw,amp,base?,phase?,cycles?}. " +
