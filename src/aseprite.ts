@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 const OPS_LUA = join(dirname(fileURLToPath(import.meta.url)), "..", "lua", "ops.lua");
 const MARKER = "__MCP_RESULT__";
 const TIMEOUT_MS = Number(process.env.ASEPRITE_TIMEOUT_MS ?? 60_000);
+const USE_WORKER = process.env.ASEPRITE_MCP_WORKER !== "0";
 
 export class AsepriteError extends Error {}
 
@@ -62,14 +63,14 @@ export function asepriteBinary(): string {
   return (cachedBinary = found);
 }
 
-/** Expand ~ and resolve relative paths against ASEPRITE_MCP_DIR (or the server's cwd). */
-export function resolvePath(p: string): string {
+/** Expand ~ and resolve relative paths against `base`, ASEPRITE_MCP_DIR or the cwd. */
+export function resolvePath(p: string, base?: string): string {
   if (p === "~" || p.startsWith("~/")) p = join(homedir(), p.slice(1));
   if (isAbsolute(p)) return p;
-  return resolve(process.env.ASEPRITE_MCP_DIR ?? process.cwd(), p);
+  return resolve(base ?? process.env.ASEPRITE_MCP_DIR ?? process.cwd(), p);
 }
 
-function exec(args: string[]): Promise<string> {
+export function exec(args: string[]): Promise<string> {
   return new Promise((ok, fail) => {
     execFile(asepriteBinary(), args, { timeout: TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err && !stdout.includes(MARKER)) {
@@ -79,23 +80,111 @@ function exec(args: string[]): Promise<string> {
   });
 }
 
-export type Step = { op: string; [k: string]: unknown };
+type Response = { id?: number; ok: boolean; results?: unknown[]; error?: string };
 
-/** Run steps against one sprite in a single Aseprite process. Returns one result per step. */
-export async function runSteps(path: string | undefined, steps: Step[]): Promise<unknown[]> {
+function parseResponse(line: string): Response {
+  return JSON.parse(line.slice(MARKER.length));
+}
+
+/**
+ * A long-lived `aseprite -b` process that reads one JSON request per stdin line.
+ * Saves the ~70ms process start per call. Requests are serialized; on crash or
+ * timeout the process is killed and a fresh one is started on the next call.
+ */
+class Worker {
+  private proc?: ChildProcessWithoutNullStreams;
+  private buf = "";
+  private nextId = 1;
+  private pending?: { id: number; ok: (r: Response) => void; fail: (e: Error) => void; timer: NodeJS.Timeout };
+  private queue: Promise<unknown> = Promise.resolve();
+
+  private start() {
+    const proc = spawn(asepriteBinary(), ["-b", "--script-param", "worker=1", "--script", OPS_LUA]);
+    proc.stdout.setEncoding("utf8");
+    proc.stdout.on("data", (d: string) => {
+      this.buf += d;
+      let nl;
+      while ((nl = this.buf.indexOf("\n")) >= 0) {
+        const line = this.buf.slice(0, nl);
+        this.buf = this.buf.slice(nl + 1);
+        if (line.startsWith(MARKER) && this.pending) {
+          const p = this.pending;
+          this.pending = undefined;
+          clearTimeout(p.timer);
+          try {
+            p.ok(parseResponse(line));
+          } catch (e) {
+            p.fail(e as Error);
+          }
+        }
+      }
+    });
+    let stderr = "";
+    proc.stderr.on("data", (d) => (stderr = (stderr + d).slice(-2000)));
+    proc.on("exit", () => {
+      if (this.proc === proc) this.proc = undefined;
+      if (this.pending) {
+        const p = this.pending;
+        this.pending = undefined;
+        clearTimeout(p.timer);
+        p.fail(new AsepriteError(`aseprite exited unexpectedly ${stderr.trim()}`));
+      }
+    });
+    proc.stdin.on("error", () => {});
+    this.proc = proc;
+    this.buf = "";
+  }
+
+  request(req: object): Promise<Response> {
+    const run = () =>
+      new Promise<Response>((ok, fail) => {
+        if (!this.proc) this.start();
+        const id = this.nextId++;
+        const timer = setTimeout(() => {
+          this.pending = undefined;
+          this.proc?.kill();
+          this.proc = undefined;
+          fail(new AsepriteError(`aseprite timed out after ${TIMEOUT_MS}ms`));
+        }, TIMEOUT_MS);
+        this.pending = { id, ok, fail, timer };
+        this.proc!.stdin.write(JSON.stringify({ ...req, id }) + "\n");
+      });
+    const result = this.queue.then(run, run);
+    this.queue = result.catch(() => {});
+    return result;
+  }
+
+  stop() {
+    this.proc?.stdin.end();
+    this.proc = undefined;
+  }
+}
+
+const worker = USE_WORKER ? new Worker() : undefined;
+export const stopWorker = () => worker?.stop();
+
+async function oneShot(req: object): Promise<Response> {
   const dir = await mkdtemp(join(tmpdir(), "aseprite-mcp-"));
   try {
     const paramsFile = join(dir, "params.json");
-    await writeFile(paramsFile, JSON.stringify({ path, steps }));
+    await writeFile(paramsFile, JSON.stringify(req));
     const stdout = await exec(["-b", "--script-param", `params=${paramsFile}`, "--script", OPS_LUA]);
     const line = stdout.split("\n").find((l) => l.startsWith(MARKER));
     if (!line) throw new AsepriteError(`no result from aseprite: ${stdout.trim().slice(0, 2000)}`);
-    const res = JSON.parse(line.slice(MARKER.length));
-    if (!res.ok) throw new AsepriteError(res.error);
-    return res.results;
+    return parseResponse(line);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+}
+
+export type Step = { op: string; [k: string]: unknown };
+
+/** Run steps against one sprite (one open, one save). Returns one result per step. */
+export async function runSteps(path: string | undefined, steps: Step[]): Promise<unknown[]> {
+  const req = { path, steps, allowImageWrites: process.env.ASEPRITE_MCP_ALLOW_IMAGE_WRITES === "1" };
+  const res = worker ? await worker.request(req) : await oneShot(req);
+  if (!res.ok) throw new AsepriteError(res.error);
+  return res.results ?? [];
 }
 
 /** Like runSteps, but appends a preview step and returns the rendered PNG as base64. */
@@ -113,34 +202,4 @@ export async function runWithPreview(
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
-}
-
-export type ExportOptions = {
-  output: string;
-  scale?: number;
-  frames?: [number, number];
-  tag?: string;
-  layer?: string;
-  splitLayers?: boolean;
-  sheet?: { type?: string; columns?: number; data?: string };
-};
-
-/** Export via the Aseprite CLI (PNG/GIF/sequence or spritesheet). Frames are 1-based. */
-export async function exportSprite(input: string, o: ExportOptions): Promise<string> {
-  const args = ["-b"];
-  if (o.layer) args.push("--layer", o.layer);
-  if (o.tag) args.push("--tag", o.tag);
-  if (o.frames) args.push("--frame-range", `${o.frames[0] - 1},${o.frames[1] - 1}`);
-  if (o.splitLayers) args.push("--split-layers");
-  args.push(input);
-  if (o.scale && o.scale !== 1) args.push("--scale", String(o.scale));
-  if (o.sheet) {
-    args.push("--sheet", o.output, "--sheet-type", o.sheet.type ?? "horizontal");
-    if (o.sheet.columns) args.push("--sheet-columns", String(o.sheet.columns));
-    if (o.sheet.data) args.push("--data", o.sheet.data, "--format", "json-array");
-  } else {
-    args.push("--save-as", o.output);
-  }
-  await exec(args);
-  return o.output;
 }

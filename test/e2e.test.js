@@ -2,7 +2,9 @@
 // Skipped when Aseprite cannot be found.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -32,26 +34,47 @@ const call = async (name, args) => {
   return r;
 };
 const text = (r) => r.content[0].text;
-
-test("create, draw_grid, read_pixels round-trip", opts, async () => {
-  await call("create_sprite", { path: file, width: 8, height: 8, palette: "pico8" });
-  await call("draw_grid", { path: file, x: 1, y: 1, rows: ["kk.", "krk", ".kk"], legend: { k: "#000", r: "#ff004d" } });
-  const r = text(await call("read_pixels", { path: file, x: 0, y: 0, width: 4, height: 4 }));
-  assert.match(r, /^4x4 at 0,0/);
-  const [, legendLine, ...rows] = r.split("\n");
-  const legend = JSON.parse(legendLine.slice(7));
+const grid = async (path, extra = {}) => {
+  const [head, ...rows] = text(await call("read_pixels", { path, ...extra })).split("\n");
+  const legend = JSON.parse(head.slice(head.indexOf(" ") + 1));
   const inv = Object.fromEntries(Object.entries(legend).map(([c, h]) => [h, c]));
+  return { rows, legend, inv };
+};
+
+test("create, draw rows, read_pixels round-trip", opts, async () => {
+  await call("create_sprite", { path: file, width: 8, height: 8, palette: "pico8" });
+  await call("draw", { path: file, x: 1, y: 1, rows: ["kk.", "krk", ".kk"], legend: { k: "#000", r: "#ff004d" } });
+  const { rows, inv } = await grid(file, { width: 4, height: 4 });
   const k = inv["#000000"], red = inv["#ff004d"];
   assert.deepEqual(rows, ["....", `.${k}${k}.`, `.${k}${red}${k}`, `..${k}${k}`]);
 });
 
-test("shapes, fill, mirror, replace_color", opts, async () => {
-  await call("draw_shape", { path: file, shape: "rectangle", x1: 0, y1: 0, x2: 7, y2: 7, color: "#fff", filled: false });
-  await call("fill", { path: file, x: 6, y: 6, color: "#00e436" });
-  await call("mirror", { path: file, mode: "left_to_right" });
-  await call("replace_color", { path: file, from: "#ffffff", to: "#29adff" });
-  const r = text(await call("read_pixels", { path: file }));
-  assert.ok(r.includes("#29adff") && !r.includes("#ffffff"), r);
+test("shapes, gradient, fill, mirror, replace", opts, async () => {
+  await call("draw", { path: file, shapes: [["rect", 0, 0, 7, 7, "#fff"], ["line", 0, 7, 7, 0, "#ffec27"]] });
+  await call("edit", { path: file, action: "fill", x: 6, y: 6, color: "#00e436" });
+  await call("edit", { path: file, action: "mirror", mode: "left_to_right" });
+  await call("edit", { path: file, action: "replace", from: "#ffffff", to: "#29adff" });
+  const { legend } = await grid(file);
+  const colors = Object.values(legend);
+  assert.ok(colors.includes("#29adff") && !colors.includes("#ffffff"), colors.join());
+  const g = join(dir, "g.aseprite");
+  await call("create_sprite", { path: g, width: 8, height: 8 });
+  await call("draw", { path: g, shapes: [["gradient", 0, 0, 7, 7, ["#000000", "#ffffff"], "v"]] });
+  const r = await grid(g);
+  assert.equal(Object.keys(r.legend).length, 2, "gradient is dithered between exactly 2 colors");
+});
+
+test("outline and shade", opts, async () => {
+  const f = join(dir, "o.aseprite");
+  await call("create_sprite", { path: f, width: 8, height: 8 });
+  await call("draw", { path: f, shapes: [["rect", 2, 2, 5, 5, "#3366cc", "#3366cc"]] });
+  await call("edit", { path: f, action: "shade", light: "top_left" });
+  await call("edit", { path: f, action: "outline" });
+  const { rows, legend } = await grid(f);
+  assert.equal(rows[0], "........");
+  assert.equal(rows[1][1], ".", "no corners by default");
+  assert.notEqual(rows[1][2], ".", "outline above the box");
+  assert.ok(Object.keys(legend).length >= 4, JSON.stringify(legend));
 });
 
 test("batch with layers, frames, preview image", opts, async () => {
@@ -59,7 +82,7 @@ test("batch with layers, frames, preview image", opts, async () => {
     path: file,
     steps: [
       { op: "layer", action: "add", name: "fx" },
-      { op: "draw_pixels", layer: "fx", pixels: [[0, 0, "#ffec27"], [7, 7, "#ffec27"]] },
+      { op: "draw", layer: "fx", pixels: [[0, 0, "#ffec27"], [7, 7, "#ffec27"]] },
       { op: "frames", action: "add", count: 2, copyFrom: 1 },
       { op: "frames", action: "duration", durationMs: 120 },
       { op: "frames", action: "tag", name: "idle", from: 1, to: 3 },
@@ -68,38 +91,24 @@ test("batch with layers, frames, preview image", opts, async () => {
     preview: { frames: "all" },
   });
   const info = JSON.parse(text(r).split("\n")[5].slice(2));
-  assert.equal(info.frames.length, 3);
-  assert.equal(info.frames[2].durationMs, 120);
-  assert.deepEqual(info.layers.map((l) => l.name), ["Layer 1", "fx"]);
-  assert.equal(info.tags[0].name, "idle");
+  assert.deepEqual(info.frameMs, [120, 120, 120]);
+  assert.deepEqual(info.layers, ["Layer 1", "fx"]);
+  assert.deepEqual(info.tags, ["idle 1-3"]);
   assert.equal(r.content[1].type, "image");
-  assert.ok(r.content[1].data.length > 100);
 });
 
 test("failing batch step reports step and saves nothing", opts, async () => {
   const before = (await stat(file)).mtimeMs;
   const r = await client.callTool({
     name: "batch",
-    arguments: { path: file, steps: [{ op: "fill", x: 0, y: 0, color: "#000" }, { op: "draw_grid", rows: ["z"], legend: {} }] },
+    arguments: { path: file, steps: [{ op: "edit", action: "fill", x: 0, y: 0, color: "#000" }, { op: "draw", rows: ["z"], legend: {} }] },
   });
   assert.ok(r.isError);
-  assert.match(r.content[0].text, /step 2 \(draw_grid\)/);
+  assert.match(r.content[0].text, /step 2 \(draw\)/);
   assert.equal((await stat(file)).mtimeMs, before);
 });
 
-test("export png and spritesheet", opts, async () => {
-  await call("export", { path: file, output: join(dir, "f1.png"), frames: [1, 1], scale: 4 });
-  await call("export", { path: file, output: join(dir, "sheet.png"), sheet: { data: join(dir, "sheet.json") } });
-  assert.ok((await stat(join(dir, "f1.png"))).size > 0);
-  assert.ok((await stat(join(dir, "sheet.json"))).size > 0);
-});
-
-test("run_lua escape hatch", opts, async () => {
-  const r = await call("run_lua", { path: file, code: "return { w = sprite.width, n = params.n }", params: { n: 3 }, save: false });
-  assert.deepEqual(JSON.parse(text(r)), { w: 8, n: 3 });
-});
-
-test("resize, layer update/delete, frame delete, preview tool", opts, async () => {
+test("resize, layer update/delete, frame delete, layer preview", opts, async () => {
   const r = await call("batch", {
     path: file,
     steps: [
@@ -113,10 +122,136 @@ test("resize, layer update/delete, frame delete, preview tool", opts, async () =
     ],
   });
   const info = JSON.parse(text(r).split("\n")[6].slice(2));
-  assert.equal(info.width, 20);
-  assert.equal(info.height, 18);
-  assert.deepEqual(info.layers.map((l) => [l.name, l.opacity]), [["Layer 1", 255], ["glow", 128]]);
-  assert.equal(info.frames.length, 2);
+  assert.equal(info.size, "20x18");
+  assert.deepEqual(info.layers, ["Layer 1", "glow [opacity 128]"]);
+  assert.equal(info.frameMs.length, 2);
   const p = await call("preview", { path: file, layer: "glow", scale: 4 });
   assert.equal(p.content[1].type, "image");
+});
+
+test("import upscaled image, extract palette, quantize", opts, async () => {
+  const src = join(dir, "src.aseprite");
+  await call("create_sprite", { path: src, width: 6, height: 6 });
+  await call("draw", { path: src, shapes: [["rect", 0, 0, 5, 5, "#102030", "#c04020"]], pixels: [[2, 2, "#c84828"]] });
+  await call("export", { path: src, output: join(dir, "big.png"), scale: 5 });
+  const imp = join(dir, "imp.aseprite");
+  const r = await call("create_sprite", { path: imp, from: join(dir, "big.png") });
+  assert.match(text(r), /"downscaled":5/);
+  const pal = JSON.parse(text(await call("palette", { path: imp, extract: { max: 2 } })));
+  assert.equal(pal.uniqueColors, 3);
+  assert.equal(pal.extracted.length, 2);
+  await call("edit", { path: imp, action: "quantize", palette: pal.extracted });
+  const { legend } = await grid(imp);
+  assert.deepEqual(new Set(Object.values(legend)), new Set(pal.extracted));
+  const ramps = JSON.parse(text(await call("palette", { ramps: [{ base: "#3366cc", steps: 3 }] })));
+  assert.equal(ramps.ramps[0].length, 3);
+  assert.equal(ramps.ramps[0][1], "#3366cc");
+});
+
+test("animate presets -> tagged output + sheet with godot/bevy + recipe CLI", opts, async () => {
+  const src = join(dir, "hero.aseprite");
+  await call("batch", {
+    path: src,
+    steps: [
+      { op: "create_sprite", width: 8, height: 8, layerName: "body" },
+      { op: "draw", shapes: [["rect", 1, 3, 6, 7, "#1d2b53", "#ff004d"]] },
+      { op: "layer", action: "add", name: "eyes" },
+      { op: "draw", layer: "eyes", pixels: [[2, 4, "#fff"], [5, 4, "#fff"]] },
+    ],
+  });
+  const before = await readFile(src);
+  const recipe = join(dir, "anim", "hero.anim.json");
+  const r = await call("animate", {
+    source: src,
+    output: join(dir, "out", "hero_anim.aseprite"),
+    padding: [0, 6, 0, 0],
+    animations: [
+      { name: "idle", preset: { name: "breathe", lag: { eyes: 0.1 } } },
+      { name: "jump", preset: "hop" },
+      { name: "hit", preset: ["hit"] },
+      { name: "spin", preset: "spin", frames: 4 },
+      { name: "custom", frames: 3, tracks: [{ layer: "eyes", visible: { seq: [1, 1, 0] } }] },
+    ],
+    export: { sheet: join(dir, "out", "hero.png"), engines: ["godot", "bevy"] },
+    saveRecipe: recipe,
+  });
+  const out = text(r);
+  assert.match(out, /"idle 1-8","jump 9-18","hit 19-23","spin 24-27","custom 28-30"/);
+  assert.equal(r.content[1].type, "image");
+  assert.deepEqual(await readFile(src), before, "source untouched");
+  const ase = JSON.parse(await readFile(join(dir, "out", "hero.json"), "utf8"));
+  assert.equal(ase.frames.length, 30);
+  assert.equal(ase.meta.frameTags.length, 5);
+  const tres = await readFile(join(dir, "out", "hero.tres"), "utf8");
+  assert.match(tres, /\[gd_resource type="SpriteFrames"/);
+  assert.match(tres, /"name": &"hit"/);
+  assert.match(tres, /"loop": false/);
+  const bevy = JSON.parse(await readFile(join(dir, "out", "hero.atlas.json"), "utf8"));
+  assert.deepEqual(bevy.animations.spin.frames, [23, 24, 25, 26]);
+  assert.equal(bevy.frame_size[1], 14);
+  // recipe is relative and rebuildable from the CLI
+  const saved = JSON.parse(await readFile(recipe, "utf8"));
+  assert.equal(saved.source, "../hero.aseprite");
+  const { stdout } = await promisify(execFile)(process.execPath, ["dist/index.js", "build", recipe]);
+  assert.match(stdout, /built in \d+ms/);
+});
+
+test("run_lua escape hatch", opts, async () => {
+  const r = await call("run_lua", { path: file, code: "return { w = sprite.width, n = params.n }", params: { n: 3 }, save: false });
+  assert.deepEqual(JSON.parse(text(r)), { w: 20, n: 3 });
+});
+
+test("worker survives errors and keeps serving", opts, async () => {
+  const r = await client.callTool({ name: "run_lua", arguments: { code: "error('boom')" } });
+  assert.ok(r.isError);
+  assert.match(r.content[0].text, /boom/);
+  const info = JSON.parse(text(await call("sprite_info", { path: file })));
+  assert.equal(info.size, "20x18");
+});
+
+test("refuses to overwrite existing images; pixelates imports to a target size", opts, async () => {
+  const png = join(dir, "guard.png");
+  await call("export", { path: file, output: png, frames: [1, 1] });
+  const before = await readFile(png);
+  const r = await client.callTool({ name: "draw", arguments: { path: png, pixels: [[0, 0, "#f00"]] } });
+  assert.ok(r.isError);
+  assert.match(r.content[0].text, /refusing to overwrite image/);
+  assert.deepEqual(await readFile(png), before);
+  const small = join(dir, "small.aseprite");
+  const res = await call("create_sprite", { path: small, from: png, width: 10 });
+  assert.match(text(res), /"h":9,.*"w":10/);
+});
+
+test("separate splits background (with islands) from subject and fills the hole", opts, async () => {
+  const f = join(dir, "sep.aseprite");
+  await call("batch", {
+    path: f,
+    steps: [
+      { op: "create_sprite", width: 12, height: 12, layerName: "art" },
+      { op: "draw", shapes: [["rect", 0, 0, 11, 11, "#332244", "#332244"], ["rect", 4, 4, 8, 8, "#000000", "#ff0000"]], pixels: [[1, 1, "#ffffff"]] },
+      { op: "edit", action: "separate" },
+    ],
+  });
+  const info = JSON.parse(text(await call("sprite_info", { path: f })));
+  assert.deepEqual(info.layers, ["background", "art"]);
+  const art = await grid(f, { layer: "art" });
+  const bg = await grid(f, { layer: "background" });
+  assert.equal(art.rows[1][1], ".", "star island moved to background");
+  assert.notEqual(art.rows[6][6], ".", "subject stays");
+  assert.ok(!bg.rows.join("").includes("."), "background hole filled");
+});
+
+test("tool schemas avoid tuple-form items (rejected by the Claude API)", opts, async () => {
+  const { tools } = await client.listTools();
+  const bad = [];
+  const walk = (o, p) => {
+    if (o && typeof o === "object")
+      for (const [k, v] of Object.entries(o)) {
+        if (k === "items" && Array.isArray(v)) bad.push(p);
+        walk(v, `${p}/${k}`);
+      }
+  };
+  for (const t of tools) walk(t.inputSchema, t.name);
+  assert.deepEqual(bad, []);
+  assert.equal(tools.length, 14);
 });
