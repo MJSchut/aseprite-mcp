@@ -97,6 +97,16 @@ Existing single-layer art can be cut into parts and walked:
 - **Remapping:** use `parts` for other layer names, e.g. `{"name": "walk_front", "parts": {"head": "skull"}}`.
 - **Backfill:** `split` grows the remaining layer into the cut by `backfill` px (default 1), so a moving arm reveals torso, not a hole.
 
+### Redrawn poses (cutout-style animation)
+
+Moving the same pixels only goes so far. For real poses, draw alternate versions of a part on extra **source frames** of the rig, and pick them per frame with a `pose` track:
+
+- Frame 1 holds the rest drawing. Frames 2, 3, … are a pose sheet that only needs the parts that change.
+- `{"layer": "arm_r", "pose": {"seq": [1, 2, 2, 3, 3, 1, 1]}}` shows rest → raised → strike. Layers without a drawing on that pose frame keep their rest drawing.
+- **Underpaint** what a part hides. Painting the torso edge behind an arm, or a dark mouth interior behind a split-off `jaw`, means raising the arm or dropping the jaw reveals something sensible.
+- Effects such as slash streaks can live on their own layer, drawn only on a pose frame, so they appear exactly when the pose track selects them.
+- The rig presets also move an optional `jaw` part together with `head`.
+
 ## AI-generated frames → clean pixel art (`ingest`)
 
 Diffusion models, image editors and video models can produce new poses that procedural animation can't. Their output isn't pixel art yet: soft edges, noise, off-palette colors, backgrounds, drifting scale and position. `ingest` cleans it up:

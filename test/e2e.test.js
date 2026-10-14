@@ -388,7 +388,7 @@ test("generate: describe schema, run predictions with the sprite as image, inges
   });
   assert.match(text(r), /^2 prediction\(s\)/);
   assert.match(text(r), /ingest .*"frames":2/s);
-  assert.deepEqual(replicateCalls.map((c) => c.input.prompt), ["pose one", "pose two"]);
+  assert.deepEqual(replicateCalls.map((c) => c.input.prompt).sort(), ["pose one", "pose two"], "parallel: arrival order varies");
   assert.equal(replicateCalls[0].input.steps, 10);
   assert.match(replicateCalls[0].input.input_image, /^data:image\/png;base64,/);
   const a = await grid(out, { frame: 1 });
@@ -396,4 +396,32 @@ test("generate: describe schema, run predictions with the sprite as image, inges
   assert.deepEqual(a.rows, b.rows);
   const raw = await stat(join(dir, "generated.gen", "gen1_01.png"));
   assert.ok(raw.size > 0, "raw outputs kept for re-ingesting");
+});
+
+test("pose track swaps a layer to an alternate drawing; layers without one keep their rest drawing", opts, async () => {
+  const f = join(dir, "poses.aseprite");
+  await call("batch", {
+    path: f,
+    steps: [
+      { op: "create_sprite", width: 8, height: 8, layerName: "body" },
+      { op: "draw", pixels: [[1, 1, "#ff0000"]] },
+      { op: "layer", action: "add", name: "arm" },
+      { op: "draw", layer: "arm", pixels: [[5, 5, "#00ff00"]] },
+      { op: "frames", action: "add", count: 1 },
+      // pose sheet (frame 2): only the arm is redrawn
+      { op: "draw", layer: "arm", frame: 2, pixels: [[6, 1, "#0000ff"]] },
+    ],
+  });
+  const out = join(dir, "poses_anim.aseprite");
+  await call("animate", {
+    source: f, output: out, preview: false,
+    animations: [{ name: "wave", frames: 2, tracks: [{ layer: "arm", pose: { seq: [1, 2] } }, { layer: "body", pose: { seq: [2, 2] } }] }],
+  });
+  const f1 = await grid(out, { frame: 1 });
+  const f2 = await grid(out, { frame: 2 });
+  const at = (g, x, y) => g.legend[g.rows[y][x]];
+  assert.equal(at(f1, 5, 5), "#00ff00");
+  assert.equal(at(f2, 6, 1), "#0000ff", "arm shows its pose-2 drawing");
+  assert.equal(f2.rows[5][5], ".", "rest arm gone in pose 2");
+  assert.equal(at(f2, 1, 1), "#ff0000", "body has no pose-2 drawing, keeps rest");
 });

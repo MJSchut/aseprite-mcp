@@ -360,7 +360,8 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
         "optionally exports a sheet. Each animation: {name, preset?, frames?, durationMs?, loop?, pivot?:bottom|center|top|[x,y], sourceFrames?|sourceTag?, tracks?}. " +
         "preset: name | {name, amount?, layers?, lag?:{layer:0.1}, color?, colors?, parts?:{head:\"skull\"}} | list (combined). " +
         `Presets: ${PRESET_HELP}. ` +
-        "tracks: [{layer?:\"*\"|name, x,y,sxPx,syPx,sx,sy,rot,shear,waveAmp,alpha,flash,dissolve,visible: curve}] " +
+        "tracks: [{layer?:\"*\"|name, x,y,sxPx,syPx,sx,sy,rot,shear,waveAmp,alpha,flash,dissolve,visible,pose: curve}] " +
+        "(pose = source frame whose drawing the layer shows: draw alternate part poses on extra source frames, swap them per frame). " +
         "curve = number | {seq:[per frame]} | {keys:[[t,v,ease?]]} (ease in|out|inout|step|back) | {wave:sine|triangle|square|saw,amp,base?,phase?,cycles?}. " +
         "Use padding when motion leaves the canvas. saveRecipe writes a re-runnable recipe (CLI: aseprite-mcp build recipe.json).",
       inputSchema: {

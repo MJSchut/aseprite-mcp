@@ -1603,6 +1603,9 @@ local function composeTransform(tracks, name, path, t, i, loop)
       if tr.cycle then tf.cycle = tr.cycle; tf.cycleShift = (i - 1) * (tr.cycleStep or 1) end
       if tr.pivot then tf.pivot = tr.pivot end
       if tr.smooth ~= nil then tf.smooth = tr.smooth end
+      -- pose: which source frame's drawing this layer shows (cel swap / cutout-style animation)
+      local po = ev("pose", nil)
+      if po then tf.pose = round(po) end
     end
   end
   return tf
@@ -1813,7 +1816,14 @@ function ops.animate(ctx, p)
       local sf = src[((i - 1) % #src) + 1]
       for li, e in ipairs(layers) do
         local tf = composeTransform(tracks, e.layer.name, e.path, t, i, loop)
-        local img = renderLayer(rest(li, sf), tf, pivot, cb, sprite, codec)
+        local r = rest(li, sf)
+        if tf.pose then
+          if tf.pose < 1 or tf.pose > N0 then fail(name .. ": pose " .. tf.pose .. " out of range (1.." .. N0 .. ")") end
+          -- pose frames only need the redrawn parts; other layers fall back to the rest drawing
+          local pr = rest(li, tf.pose)
+          if pr.bbox then r = pr end
+        end
+        local img = renderLayer(r, tf, pivot, cb, sprite, codec)
         if img and not img:isEmpty() then
           -- store trimmed cels: smaller files, faster saves and exports
           local bb = img:shrinkBounds()

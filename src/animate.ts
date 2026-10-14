@@ -146,7 +146,7 @@ const PRESETS: Record<string, { help: string; make: (a: number, o: PresetOpts) =
 // remap with options.parts, e.g. {"head":"skull"}. Parts a character lacks are simply skipped.
 // ---------------------------------------------------------------------------
 
-const PART_NAMES = ["head", "torso", "arm_l", "arm_r", "leg_l", "leg_r"] as const;
+const PART_NAMES = ["head", "jaw", "torso", "arm_l", "arm_r", "leg_l", "leg_r"] as const;
 type Part = (typeof PART_NAMES)[number];
 
 function partsOf(o: PresetOpts): Record<Part, string> {
@@ -166,7 +166,7 @@ Object.assign(PRESETS, {
       return {
         frames: 8, durationMs: 140, tracks: [
           { layer: p.torso, y: { seq: breath } },
-          { layer: p.head, y: { seq: lag(1) } },
+          { layer: [p.head, p.jaw], y: { seq: lag(1) } },
           { layer: [p.arm_l, p.arm_r], y: { seq: lag(2) } },
         ],
       };
@@ -178,13 +178,13 @@ Object.assign(PRESETS, {
       const p = partsOf(o);
       const lift = [0, -a / 2, -a, -a / 2, 0, 0, 0, 0].map(round);
       const half = (s: number[]) => s.map((_, i) => s[(i + 4) % 8]);
-      const body = [p.torso, p.arm_l, p.arm_r, p.head];
+      const body = [p.torso, p.arm_l, p.arm_r, p.head, p.jaw];
       return {
         frames: 8, durationMs: 100, tracks: [
           { layer: p.leg_l, y: { seq: lift } },
           { layer: p.leg_r, y: { seq: half(lift) } },
           { layer: body, y: { seq: [1, 0, 0, 0, 1, 0, 0, 0] }, x: { seq: [0, 0, 1, 0, 0, 0, -1, 0] } },
-          { layer: p.head, y: { seq: [0, 1, 0, 0, 0, 1, 0, 0] } },
+          { layer: [p.head, p.jaw], y: { seq: [0, 1, 0, 0, 0, 1, 0, 0] } },
           { layer: p.arm_l, y: { seq: [0, 0, 0, 0, 0, -1, -1, 0] } },
           { layer: p.arm_r, y: { seq: [0, -1, -1, 0, 0, 0, 0, 0] } },
         ],
