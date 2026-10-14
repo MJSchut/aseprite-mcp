@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { watch } from "node:fs";
 import { execFile } from "node:child_process";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -13,6 +13,7 @@ import { resolvePath, runSteps, runWithPreview, stopWorker, type Step } from "./
 import { buildRecipe, loadRecipe, PRESET_HELP, saveRecipe, type Recipe } from "./animate.js";
 import { exportSprite } from "./export.js";
 import { PALETTES, resolvePalette } from "./palettes.js";
+import { describeSchema, downloadOutputs, imageField, modelSchema, predict } from "./replicate.js";
 
 // ---------------------------------------------------------------------------
 // CLI: `aseprite-mcp build <recipe.json> [--watch]` for game build pipelines
@@ -431,6 +432,101 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
           frames = await extractVideoFrames(resolvePath(video.path), tmp, video);
         }
         return await run(file, [{ op: "ingest", ...args, frames }], pv ? { tag: args.tag } : false);
+      } catch (e) {
+        return errorResult(e);
+      } finally {
+        if (tmp) await rm(tmp, { recursive: true, force: true });
+      }
+    },
+  );
+
+  server.registerTool(
+    "generate",
+    {
+      description:
+        "Generate frames with any Replicate model (env REPLICATE_API_TOKEN), then clean them into pixel art with ingest. " +
+        "describe=true: list the model's inputs first. image: your sprite rendered upscaled on a solid background, sent as the model's " +
+        "image input (auto-detected field). prompts: one prediction per prompt (e.g. per pose), run in parallel. " +
+        "Raw outputs are kept in outDir so you can re-ingest without paying again. Videos need ffmpeg. " +
+        "Ideas: retro-diffusion/rd-animation (pixel animation), black-forest-labs/flux-kontext-pro (pose edit per prompt), image-to-video models.",
+      inputSchema: {
+        model: z.string().describe("owner/name or owner/name:version"),
+        describe: z.boolean().optional(),
+        input: z.record(z.string(), z.unknown()).optional().describe("model inputs"),
+        image: z
+          .object({
+            path: z.string(),
+            frame: int.optional(),
+            hide: z.array(z.string()).optional().describe("layers to hide, e.g. background"),
+            size: int.optional().describe("longest side px, default 512"),
+            background: z.string().optional().describe("default #ffffff"),
+          })
+          .optional(),
+        imageField: z.string().optional(),
+        prompts: z.array(z.string()).optional(),
+        outDir: z.string().optional(),
+        ingest: z.looseObject({ path: z.string() }).optional().describe("ingest args: path, reference, tag, align, height, palette, sheet..."),
+        preview,
+      },
+    },
+    async ({ model, describe, input = {}, image, imageField: field, prompts, outDir, ingest, preview: pv }) => {
+      let tmp: string | undefined;
+      try {
+        if (describe) {
+          const schema = await modelSchema(model);
+          return text(`${model} inputs (image goes to: ${imageField(schema) ?? "none"})\n${describeSchema(schema)}`);
+        }
+        const base = { ...input };
+        if (image) {
+          const key = field ?? imageField(await modelSchema(model));
+          if (!key) throw new Error(`${model} has no file input; pass imageField`);
+          tmp = await mkdtemp(join(tmpdir(), "aseprite-mcp-gen-"));
+          const png = join(tmp, "input.png");
+          const { path: imgPath, ...opts } = image;
+          await runSteps(resolvePath(imgPath), [{ op: "render", output: png, ...opts }]);
+          base[key] = "data:image/png;base64," + (await readFile(png)).toString("base64");
+        }
+        const inputs = prompts?.length ? prompts.map((prompt) => ({ ...base, prompt })) : [base];
+        const dir = resolvePath(
+          outDir ?? (ingest ? String(ingest.path).replace(/\.[^./]+$/, "") + ".gen" : "replicate-out"),
+        );
+        const t0 = Date.now();
+        // up to 4 predictions at a time, outputs kept in prompt order
+        const results: { id: string; secs?: number; files: string[] }[] = new Array(inputs.length);
+        let next = 0;
+        await Promise.all(
+          Array.from({ length: Math.min(4, inputs.length) }, async () => {
+            while (next < inputs.length) {
+              const i = next++;
+              const p = await predict(model, inputs[i]);
+              results[i] = { id: p.id, secs: p.metrics?.predict_time, files: await downloadOutputs(p.output, dir, `gen${i + 1}`) };
+            }
+          }),
+        );
+        const files = results.flatMap((r) => r.files);
+        const lines = [
+          `${inputs.length} prediction(s) in ${((Date.now() - t0) / 1000).toFixed(1)}s: ` +
+            results.map((r) => `${r.id}${r.secs ? ` (${r.secs.toFixed(1)}s)` : ""}`).join(", "),
+          ...files,
+        ];
+        if (!ingest) return text(lines.join("\n"));
+        // videos -> frames, then clean everything up in one ingest
+        const frames: string[] = [];
+        for (const f of files) {
+          if (/\.(mp4|webm|mov|mkv)$/i.test(f)) {
+            const fd = f.replace(/\.[^.]+$/, "_frames");
+            await mkdir(fd, { recursive: true });
+            frames.push(...(await extractVideoFrames(f, fd, (ingest.video as object) ?? {})));
+          } else frames.push(f);
+        }
+        const { path: ingestPath, video: _v, ...ingestArgs } = ingest as Record<string, unknown> & { path: string };
+        const step = ingestArgs.sheet
+          ? { op: "ingest", ...ingestArgs, sheet: { ...(ingestArgs.sheet as object), path: frames[0] } }
+          : { op: "ingest", ...ingestArgs, frames };
+        const res = await run(ingestPath, [step], pv ? { tag: ingestArgs.tag } : false);
+        const first = res.content[0];
+        if (first?.type === "text") first.text = lines.join("\n") + "\ningest " + first.text;
+        return res;
       } catch (e) {
         return errorResult(e);
       } finally {

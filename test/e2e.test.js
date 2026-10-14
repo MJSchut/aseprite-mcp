@@ -3,6 +3,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createServer } from "node:http";
 import { promisify } from "node:util";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,15 +16,60 @@ let hasAseprite = true;
 try { asepriteBinary(); } catch { hasAseprite = false; }
 const opts = { skip: !hasAseprite && "Aseprite not installed" };
 
-let client, dir, file;
+let client, dir, file, mock;
+// Fake Replicate API: one model with a schema, predictions that need one poll, PNG outputs from the test dir.
+const replicateCalls = [];
+function startMockReplicate() {
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url, "http://x");
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const json = (o, code = 200) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
+    if (url.pathname.startsWith("/out/")) {
+      res.writeHead(200, { "content-type": "image/png" });
+      return res.end(await readFile(join(dir, url.pathname.slice(5))));
+    }
+    if (req.headers.authorization !== "Bearer test-token") return json({ detail: "unauthorized" }, 401);
+    if (req.method === "GET" && url.pathname === "/v1/models/test/pixel") {
+      return json({ latest_version: { id: "v1", openapi_schema: { components: { schemas: {
+        Input: { required: ["prompt"], properties: {
+          prompt: { type: "string", description: "What to draw" },
+          input_image: { type: "string", format: "uri" },
+          steps: { type: "integer", default: 20, minimum: 1, maximum: 50 },
+          style: { allOf: [{ $ref: "#/components/schemas/style" }], default: "a" },
+        } },
+        style: { enum: ["a", "b"] },
+      } } } } });
+    }
+    if (req.method === "POST" && url.pathname === "/v1/models/test/pixel/predictions") {
+      let body = "";
+      for await (const c of req) body += c;
+      const n = replicateCalls.push(JSON.parse(body));
+      return json({ id: `p${n}`, status: "starting", urls: { get: `${base}/v1/predictions/p${n}` } });
+    }
+    const m = /^\/v1\/predictions\/p(\d+)$/.exec(url.pathname);
+    if (m) {
+      return json({ id: `p${m[1]}`, status: "succeeded", output: [`${base}/out/ai_${((m[1] - 1) % 2) + 1}.png`],
+        metrics: { predict_time: 1.5 }, urls: { get: `${base}${url.pathname}` } });
+    }
+    json({ detail: "not found" }, 404);
+  });
+  return new Promise((ok) => server.listen(0, "127.0.0.1", () => ok(server)));
+}
+
 before(async () => {
   if (!hasAseprite) return;
   dir = await mkdtemp(join(tmpdir(), "aseprite-mcp-test-"));
   file = join(dir, "t.aseprite");
+  mock = await startMockReplicate();
   client = new Client({ name: "test", version: "0" });
-  await client.connect(new StdioClientTransport({ command: process.execPath, args: ["dist/index.js"] }));
+  await client.connect(new StdioClientTransport({
+    command: process.execPath,
+    args: ["dist/index.js"],
+    env: { ...process.env, REPLICATE_API_TOKEN: "test-token", REPLICATE_API_BASE: `http://127.0.0.1:${mock.address().port}/v1` },
+  }));
 });
 after(async () => {
+  mock?.close();
   await client?.close();
   if (dir) await rm(dir, { recursive: true, force: true });
 });
@@ -253,7 +299,7 @@ test("tool schemas avoid tuple-form items (rejected by the Claude API)", opts, a
   };
   for (const t of tools) walk(t.inputSchema, t.name);
   assert.deepEqual(bad, []);
-  assert.equal(tools.length, 15);
+  assert.equal(tools.length, 16);
 });
 
 test("split rigs a character into parts; walk_front lifts legs alternately", opts, async () => {
@@ -323,4 +369,31 @@ test("ingest cleans noisy upscaled frames on a background into pixel art", opts,
   const b = await grid(truth);
   assert.deepEqual(a.rows, b.rows);
   assert.deepEqual(new Set(Object.values(a.legend)), new Set(Object.values(b.legend)));
+});
+
+test("generate: describe schema, run predictions with the sprite as image, ingest results", opts, async () => {
+  const d = text(await call("generate", { model: "test/pixel", describe: true }));
+  assert.match(d, /image goes to: input_image/);
+  assert.match(d, /style: "a"\|"b" ="a"/);
+  assert.match(d, /steps: integer \[1\.\.50\] =20/);
+  assert.match(d, /prompt: string \(required\) — What to draw/);
+  const truth = join(dir, "truth.aseprite");
+  const out = join(dir, "generated.aseprite");
+  const r = await call("generate", {
+    model: "test/pixel",
+    input: { steps: 10 },
+    image: { path: truth, size: 64 },
+    prompts: ["pose one", "pose two"],
+    ingest: { path: out, reference: truth, tag: "gen", align: "feet" },
+  });
+  assert.match(text(r), /^2 prediction\(s\)/);
+  assert.match(text(r), /ingest .*"frames":2/s);
+  assert.deepEqual(replicateCalls.map((c) => c.input.prompt), ["pose one", "pose two"]);
+  assert.equal(replicateCalls[0].input.steps, 10);
+  assert.match(replicateCalls[0].input.input_image, /^data:image\/png;base64,/);
+  const a = await grid(out, { frame: 1 });
+  const b = await grid(truth);
+  assert.deepEqual(a.rows, b.rows);
+  const raw = await stat(join(dir, "generated.gen", "gen1_01.png"));
+  assert.ok(raw.size > 0, "raw outputs kept for re-ingesting");
 });

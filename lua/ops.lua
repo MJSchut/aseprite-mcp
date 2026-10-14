@@ -1384,6 +1384,31 @@ function ops.preview(ctx, p)
   return { w = out.width, h = out.height, scale = s }
 end
 
+-- Flattened frame upscaled (nearest) onto a solid background: input for image/video models.
+-- p: { output, frame?, hide?: [layer names], size? (longest side, default 512), background? (default #ffffff) }
+function ops.render(ctx, p)
+  local sprite = need(ctx)
+  local frame = resolveFrame(sprite, p.frame)
+  local hidden = {}
+  for _, name in ipairs(p.hide or {}) do
+    for _, e in ipairs(allLayers(sprite.layers)) do
+      if e.layer.name == name or e.path == name then hidden[#hidden + 1] = { e.layer, e.layer.isVisible }; e.layer.isVisible = false end
+    end
+  end
+  local img = renderRGB(sprite, frame)
+  for _, h in ipairs(hidden) do h[1].isVisible = h[2] end
+  local s = max(1, (p.size or 512) // max(sprite.width, sprite.height))
+  img:resize { width = sprite.width * s, height = sprite.height * s, method = "nearest" }
+  local out = Image(img.width, img.height, ColorMode.RGB)
+  if p.background ~= "transparent" then
+    local r, g, b = parseRGBA(p.background or "#ffffff")
+    out:clear(pc.rgba(r, g, b, 255))
+  end
+  out:drawImage(img, Point(0, 0), 255, BlendMode.NORMAL)
+  out:saveAs(p.output)
+  return { output = p.output, w = out.width, h = out.height, scale = s }
+end
+
 ---------------------------------------------------------------------------
 -- layers / frames / resize
 ---------------------------------------------------------------------------
@@ -2140,7 +2165,7 @@ end
 -- Runner
 ---------------------------------------------------------------------------
 
-local READ_ONLY = { sprite_info = true, read_pixels = true, preview = true, palette = true }
+local READ_ONLY = { sprite_info = true, read_pixels = true, preview = true, palette = true, render = true }
 
 -- Opens the sprite once, runs every step, saves once if anything changed.
 -- A failing step aborts the request and nothing is saved.

@@ -8,7 +8,7 @@ It also includes a CLI (`aseprite-mcp build recipe.json`), so the same animation
 
 - **Built for how a model draws.** `draw` takes ASCII rows plus a color legend, shape tuples and dithered gradients. `read_pixels` returns the same grid format. `preview` returns a zoomed image with a pixel grid that the model can actually look at.
 - **Fast.** One persistent Aseprite worker process handles every call, so typical calls take **0.5–2 ms** (a cold `aseprite -b` start is ~70 ms per call). `batch` runs many steps with one open and one save.
-- **Cheap on context.** 15 tools totalling ~3.6k tokens of schema. Inputs and outputs are terse.
+- **Cheap on context.** 16 tools totalling ~4k tokens of schema. Inputs and outputs are terse.
 - **Art helpers.** Selective auto-outline, light-direction shading with hue-shifted shadows and highlights, palette ramps, palette extraction, quantize-to-palette with Bayer or Floyd–Steinberg dithering, mirroring, region copy, seamless tile shifting.
 - **Importing existing art.** Upscaled pixel art is detected and reduced to its native resolution. Hi-res art can be pixelated to a target size by majority color per block. `separate` splits the background from the subject (and fills the hole behind it) so only the subject animates.
 - **Animation framework.** 22 presets (`breathe`, `hop`, `hit`, `death`, `spin`, `sway`, `wave`, `cycle`, …), composable per-layer tracks with keyframes, waves and easing, secondary motion via per-layer lag, and RotSprite-smoothed rotation.
@@ -32,6 +32,7 @@ It also includes a CLI (`aseprite-mcp build recipe.json`), so the same animation
 | `export` | PNG/GIF/sequence, or sprite sheet + JSON (+ Godot / Bevy files) |
 | `animate` | Static art → tagged animations → sprite sheet, from inline args or a recipe file |
 | `ingest` | AI/video/hand-made frames → background removed, palette-locked, grid-snapped, aligned, tagged animation |
+| `generate` | Run any Replicate model (diffusion, pixel-art animation, video) with your sprite as input, then `ingest` the results |
 | `batch` | Many steps in one call |
 | `run_lua` | Escape hatch: Aseprite Lua with `sprite` and `params` |
 
@@ -116,6 +117,26 @@ Inputs: image files, a sprite sheet grid, or a video (`ffmpeg` required). Each c
 ```
 
 Measured on synthetic diffusion-style frames (8× upscale, blurred edges, color noise and tint, gradient background), `ingest` recovers the original 64×64 frames at **~99% per-pixel accuracy** in about 0.5 s per 512px frame.
+
+## Generating frames with Replicate (`generate`)
+
+`generate` runs any [Replicate](https://replicate.com) model and pipes the output straight into `ingest`:
+
+- `describe: true` lists the model's inputs, since every model names them differently.
+- `image` renders your sprite upscaled on a solid background and sends it to the model's image input (auto-detected).
+- `prompts` runs one prediction per prompt, for example one per pose, 4 at a time.
+- Raw outputs are kept in `<ingest path>.gen/`, so you can re-run cleanup with other settings without paying again.
+- Video outputs are split into frames with `ffmpeg` (`brew install ffmpeg`).
+
+```json
+{ "model": "black-forest-labs/flux-kontext-pro",
+  "image": { "path": "art/hero.aseprite", "hide": ["background"] },
+  "prompts": ["same character, left foot forward mid-stride, side view, plain white background",
+              "same character, legs passing, side view, plain white background", "..."],
+  "ingest": { "path": "build/hero.aseprite", "reference": "art/hero.aseprite", "tag": "walk", "align": "feet" } }
+```
+
+Setup: create a token at [replicate.com/account/api-tokens](https://replicate.com/account/api-tokens) and put it in the MCP server's env as `REPLICATE_API_TOKEN`. In Claude Code's `~/.claude.json` that's `"mcpServers": { "aseprite": { ..., "env": { "REPLICATE_API_TOKEN": "r8_..." } } }`. Restart the session afterwards.
 
 ## Game engines
 
