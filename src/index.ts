@@ -84,7 +84,8 @@ const PASSES_PROMPT = (subject?: string) => `Draw ${subject ?? "the subject"} as
 2. Color masses: split each material into 2-3 big areas of light and shadow (top/lit side vs underside, ambient occlusion where forms overlap or meet the ground). Big shapes, no noise.
 3. Volume: edit volume per material (colors = that material's flat tone) to turn masses into lit rounded forms; use dither 0.3-0.6 for soft materials (foliage, fur), 0 for hard ones (metal, horn). Overlapping canopy blobs drawn in slightly different mid tones get shaded as separate clumps.
 4. Detail: edit scatter for texture that follows the light (leaves on foliage, bark streaks on trunks, scales, grass, stone), density 0.4-0.8; then hand-draw focal details with draw rows/pixels: eyes as shaped clusters (lid line, pupil, 1px glint), nostrils/mouth carved into the form with shading, claws, highlights on the lit edge. Keep the most contrast and detail at the focal point (face), less elsewhere.
-5. Finish: edit outline (auto, darker neighbor color) -> selout (lighter outline on the lit side, softer inner lines) -> aa (soften stair-steps on curves) -> pixel_perfect (no doubled corners); round any region that still reads boxy. Remove orphan pixels, check the palette (sprite_info palette=true) has no near-duplicate colors.
+5. Finish: edit simplify (merge shading noise) -> outline (auto, darker neighbor color) -> selout (lighter outline on the lit side, softer inner lines) -> aa (soften stair-steps on curves) -> pixel_perfect (no doubled corners); round any region that still reads boxy. Check the palette (sprite_info palette=true) has no near-duplicate colors.
+5b. Details last: eyes, nostrils, glints, teeth, buttons go on after the finishing passes (selout and simplify would otherwise recolor or merge them). Use 3 tones per material and keep detail at the focal point; pixel art sits between simple and detailed.
 6. Review: preview at 1x and 4x. Ask: does it read at 1x? Is the light consistent? Do any straight parallel lines or perfect rectangles remain on organic forms? Fix by hand.
 
 For animation, keep parts (head, jaw, limbs, tail) on their own layers from the blockout on, and draw alternate poses on extra source frames for animate pose tracks.`;
@@ -94,9 +95,9 @@ async function startServer() {
 Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or palette ramps, 3-4 hue-shifted tones per material), one light direction. Draw, don't assemble: silhouettes from blob/curve (not rect/ellipse), S-curves and taper over straight parallel lines, asymmetry; shape features into the form (brow over eyes, snout as part of the head) instead of pasting shapes on top; eyes as small shaped clusters (lid line, pupil, 1px glint). Work in passes, one layer each, preview after every pass (prompt pixel_art_passes has the full method):
 1 blockout: silhouettes from blob/ellipse/curve, flat mid color; 2 color masses: big light/shadow areas, 2-3 tones per material;
 3 volume: edit volume (forms lit from one direction, hue-shifted ramp); 4 detail: edit scatter (leaf/grass/bark/scale clusters following the light) + hand-placed details;
-5 finish: edit simplify (no noise) -> outline -> selout -> pixel_perfect, round where shapes read boxy. Aim between simple and detailed: 3 tones per material, clean clusters, detail only at the focal point. Fix by hand with read_pixels/draw rows. Use batch for many edits; separate part layers so animate can move them.`;
+5 finish: edit simplify (no noise) -> outline -> selout -> pixel_perfect, round where shapes read boxy; 6 details LAST (eyes, nostrils, glints, teeth) so passes don't alter them. Aim between simple and detailed: 3 tones per material, clean clusters, detail only at the focal point; for cute/cartoon, exaggerate (big head, big eyes with glints, bold outline). Fix by hand with read_pixels/draw rows. Use batch for many edits; separate part layers so animate can move them.`;
 
-  const server = new McpServer({ name: "aseprite-mcp", version: "2.0.0" }, { instructions: INSTRUCTIONS });
+  const server = new McpServer({ name: "aseprite-mcp", version: "2.1.0" }, { instructions: INSTRUCTIONS });
 
   const path = z.string();
   const color = z.string();
