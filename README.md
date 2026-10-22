@@ -33,6 +33,7 @@ It also includes a CLI (`aseprite-mcp build recipe.json`), so the same animation
 | `animate` | Static art → tagged animations → sprite sheet, from inline args or a recipe file |
 | `ingest` | AI/video/hand-made frames → background removed, palette-locked, grid-snapped, aligned, tagged animation |
 | `generate` | Run any Replicate model (diffusion, pixel-art animation, video) with your sprite as input, then `ingest` the results |
+| `character` | A chibi person from organic parts (hair styles, witch/wizard/top hats, hoods, robes/dresses/coats/armor with hem styles, sleeves, capes, boots, extras like halo, ears, tail, aura) on its own layer, outlined, with proper eyes |
 | `batch` | Many steps in one call |
 | `run_lua` | Escape hatch: Aseprite Lua with `sprite` and `params` |
 

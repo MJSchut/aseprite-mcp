@@ -299,7 +299,7 @@ test("tool schemas avoid tuple-form items (rejected by the Claude API)", opts, a
   };
   for (const t of tools) walk(t.inputSchema, t.name);
   assert.deepEqual(bad, []);
-  assert.equal(tools.length, 16);
+  assert.equal(tools.length, 17);
 });
 
 test("split rigs a character into parts; walk_front lifts legs alternately", opts, async () => {
@@ -573,4 +573,21 @@ test("tiny eyes keep the glint on the light side for both eyes of a pair", opts,
   assert.equal(glints.length, 2);
   assert.equal(glints[0][1], glints[1][1], "same row");
   assert.equal(glints[1][0] - glints[0][0], 6, "same side of each eye (top-left light), not mirrored");
+});
+
+test("character builds an outlined person from parts on its own layer", opts, async () => {
+  const f = join(dir, "person.aseprite");
+  await call("create_sprite", { path: f, width: 48, height: 72 });
+  const r = await call("character", {
+    path: f, x: 24, y: 68, layer: "witch",
+    spec: { hair: { style: "long", color: "green" }, hat: { type: "witch", color: "red", band: "gold" }, top: { type: "robe", color: "black", trim: "gold" }, cape: { type: "tendrils", color: "red" } },
+  });
+  assert.ok(text(r).length > 0);
+  const info = JSON.parse(text(await call("sprite_info", { path: f })));
+  assert.ok(info.layers.includes("witch"));
+  const g = await grid(f, { layer: "witch" });
+  const colors = Object.values(g.legend);
+  assert.ok(colors.includes("#1a1220"), "outlined");
+  assert.ok(colors.includes("#ffffff"), "eye glints");
+  assert.ok(colors.length >= 10, `many tones (${colors.length})`);
 });

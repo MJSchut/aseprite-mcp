@@ -14,6 +14,7 @@ import { buildRecipe, loadRecipe, PRESET_HELP, saveRecipe, type Recipe } from ".
 import { exportSprite } from "./export.js";
 import { PALETTES, resolvePalette } from "./palettes.js";
 import { describeSchema, downloadOutputs, imageField, modelSchema, predict } from "./replicate.js";
+import { personSteps, RAMPS } from "./parts.js";
 
 // ---------------------------------------------------------------------------
 // CLI: `aseprite-mcp build <recipe.json> [--watch]` for game build pipelines
@@ -99,7 +100,7 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
 3 volume: edit volume (forms lit from one direction, hue-shifted ramp); 4 detail: edit scatter (leaf/grass/bark/scale clusters following the light) + hand-placed details;
 5 finish: edit simplify (no noise) -> outline -> selout -> pixel_perfect, round where shapes read boxy; 6 details LAST (eyes, nostrils, glints, teeth) so passes don't alter them; draw every eye with the eye shape (anatomy when big, tiny mode at <=3px) so all glints sit on the light side. Aim between simple and detailed: 3 tones per material, clean clusters, detail only at the focal point; for cute/cartoon, exaggerate (big head, big eyes with glints) and keep a solid dark outline (skip selout, which softens it). Fix by hand with read_pixels/draw rows. Use batch for many edits; separate part layers so animate can move them.`;
 
-  const server = new McpServer({ name: "aseprite-mcp", version: "2.2.0" }, { instructions: INSTRUCTIONS });
+  const server = new McpServer({ name: "aseprite-mcp", version: "2.3.0" }, { instructions: INSTRUCTIONS });
 
   const path = z.string();
   const color = z.string();
@@ -146,7 +147,9 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
   ): Promise<CallToolResult> {
     try {
       const p = file ? resolvePath(file) : undefined;
-      const normalized = steps.map(normalizeStep);
+      // macro ops expand into primitive steps (a person = layer + body + simplify + outline + details)
+      const expanded = steps.flatMap((st) => (st.op === "person" ? (personSteps(st) as Step[]) : [st]));
+      const normalized = expanded.map(normalizeStep);
       if (pv) {
         const { results, png } = await runWithPreview(p, normalized, pv);
         return { content: [{ type: "text", text: format(results) }, { type: "image", data: png, mimeType: "image/png" }] };
@@ -590,8 +593,33 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
     }),
   );
 
+  server.registerTool(
+    "character",
+    {
+      description:
+        "Build a chibi character (~44px at scale 1, feet at x,y) from organic parts on its own layer: body, simplify, outline, then eyes. " +
+        "spec: {skin, eyes, glowEyes, hair:{style:long|bob|spiky|bun|ponytail|none,color}, " +
+        "hat:{type:witch|wizard|top|hood|beret|crown,color,band,height,bend,droop,brim}, " +
+        "top:{type:robe|dress|tunic|coat|armor,color,inner,trim,hem:straight|zigzag|ragged|flared}, sleeves:{type:fitted|puffed|bell,color}, " +
+        "cape:{type:flowing|ragged|tendrils,color}, legs, boots:{type:short|tall|pointy,color}, belt, " +
+        "extras:[halo,catEars,elfEars,foxTail,goggles,horns,aura,spikes,staff], extraColor}. " +
+        `Colors: ramp names (${Object.keys(RAMPS).join(" ")}) or [shadow,base,light] hex. Batch op: person.`,
+      inputSchema: {
+        path,
+        x: int,
+        y: int,
+        spec: z.record(z.string(), z.unknown()),
+        scale: int.optional(),
+        layer: z.string().optional(),
+        frame,
+        preview,
+      },
+    },
+    ({ path: file, preview: pv, ...args }) => run(file, [{ op: "person", ...args }], pv ? { frame: args.frame } : false),
+  );
+
   const BATCH_OPS = [
-    "create_sprite", "sprite_info", "draw", "edit", "palette", "read_pixels", "layer", "frames", "resize", "animate", "ingest",
+    "create_sprite", "sprite_info", "draw", "edit", "palette", "read_pixels", "layer", "frames", "resize", "animate", "ingest", "person",
     "run_lua",
   ] as const;
 
