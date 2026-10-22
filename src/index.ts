@@ -79,7 +79,7 @@ async function extractVideoFrames(
 
 const PASSES_PROMPT = (subject?: string) => `Draw ${subject ?? "the subject"} as pixel art in passes, the way a pixel artist works. One layer per pass, batch the steps of a pass, preview at 4x+ after each pass and fix what reads wrong before moving on.
 
-0. Plan: canvas size, light direction (default top_left), palette: one hue-shifted ramp of 3-5 tones per material (palette ramps), plus one dark outline color. Decide the silhouette and gesture (S-curve, lean, asymmetry) before drawing.
+0. Plan: canvas size big enough for the features (faces with real eyes ~64-96px; draw large, display at a lower scale), light direction (default top_left), palette: one hue-shifted ramp of 3-5 tones per material (palette ramps), plus one dark outline color. Decide the silhouette and gesture (S-curve, lean, asymmetry) before drawing.
 1. Blockout (layer "blockout"): big silhouette shapes only, in one flat mid tone per material. Use overlapping ellipses/blobs for organic masses (a canopy = 5-9 overlapping round blobs of different sizes; a head = one blob with brow, cheek and snout bumps), curves with taper for limbs, trunks, necks, horns, tails. No rects for living things. Check: is the silhouette readable and interesting as a solid shape?
 2. Color masses: split each material into 2-3 big areas of light and shadow (top/lit side vs underside, ambient occlusion where forms overlap or meet the ground). Big shapes, no noise.
 3. Volume: edit volume per material (colors = that material's flat tone) to turn masses into lit rounded forms; use dither 0.3-0.6 for soft materials (foliage, fur), 0 for hard ones (metal, horn). Overlapping canopy blobs drawn in slightly different mid tones get shaded as separate clumps.
@@ -92,12 +92,13 @@ For animation, keep parts (head, jaw, limbs, tail) on their own layers from the 
 
 async function startServer() {
   const INSTRUCTIONS = `Aseprite pixel art. Coords 0-based from top-left; frames 1-based. Colors "#rgb" "#rrggbb" "#rrggbbaa" "transparent". Drawing replaces pixels.
+Resolution first: give features room (a face with readable eyes needs ~64-96px; props 16-48px). Draw bigger and display at a lower scale rather than cramming detail into few pixels.
 Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or palette ramps, 3-4 hue-shifted tones per material), one light direction. Draw, don't assemble: silhouettes from blob/curve (not rect/ellipse), S-curves and taper over straight parallel lines, asymmetry; shape features into the form (brow over eyes, snout as part of the head) instead of pasting shapes on top; eyes as small shaped clusters (lid line, pupil, 1px glint). Work in passes, one layer each, preview after every pass (prompt pixel_art_passes has the full method):
 1 blockout: silhouettes from blob/ellipse/curve, flat mid color; 2 color masses: big light/shadow areas, 2-3 tones per material;
 3 volume: edit volume (forms lit from one direction, hue-shifted ramp); 4 detail: edit scatter (leaf/grass/bark/scale clusters following the light) + hand-placed details;
-5 finish: edit simplify (no noise) -> outline -> selout -> pixel_perfect, round where shapes read boxy; 6 details LAST (eyes, nostrils, glints, teeth) so passes don't alter them. Aim between simple and detailed: 3 tones per material, clean clusters, detail only at the focal point; for cute/cartoon, exaggerate (big head, big eyes with glints, bold outline). Fix by hand with read_pixels/draw rows. Use batch for many edits; separate part layers so animate can move them.`;
+5 finish: edit simplify (no noise) -> outline -> selout -> pixel_perfect, round where shapes read boxy; 6 details LAST (eyes, nostrils, glints, teeth) so passes don't alter them. Aim between simple and detailed: 3 tones per material, clean clusters, detail only at the focal point; for cute/cartoon, exaggerate (big head, big eyes with glints) and keep a solid dark outline (skip selout, which softens it). Fix by hand with read_pixels/draw rows. Use batch for many edits; separate part layers so animate can move them.`;
 
-  const server = new McpServer({ name: "aseprite-mcp", version: "2.1.0" }, { instructions: INSTRUCTIONS });
+  const server = new McpServer({ name: "aseprite-mcp", version: "2.1.1" }, { instructions: INSTRUCTIONS });
 
   const path = z.string();
   const color = z.string();

@@ -1,6 +1,6 @@
 {
   "name": "aseprite-mcp",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Token-efficient MCP server for creating pixel art with Aseprite",
   "main": "dist/index.js",
   "scripts": {
