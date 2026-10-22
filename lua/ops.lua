@@ -346,6 +346,12 @@ local DIRS = { forward = AniDir.FORWARD, reverse = AniDir.REVERSE, pingpong = An
 local DIR_NAMES = {}
 for k, v in pairs(DIRS) do DIR_NAMES[v] = k end
 
+-- Light directions: where the light comes from, as a unit-ish screen vector.
+local LIGHT = {
+  top_left = { -1, -1 }, top = { 0, -1 }, top_right = { 1, -1 }, left = { -1, 0 },
+  right = { 1, 0 }, bottom_left = { -1, 1 }, bottom = { 0, 1 }, bottom_right = { 1, 1 },
+}
+
 ---------------------------------------------------------------------------
 -- Drawing primitives
 ---------------------------------------------------------------------------
@@ -673,6 +679,151 @@ function ops.sprite_info(ctx, p)
   }
 end
 
+---------------------------------------------------------------------------
+-- Organic shapes: Catmull-Rom splines through control points
+---------------------------------------------------------------------------
+
+-- Dense samples along a Catmull-Rom spline through pts ({{x,y},...}); closed wraps around.
+local function splineSamples(pts, closed)
+  local n = #pts
+  if n < 2 then fail("a curve needs at least 2 points") end
+  local function P(i)
+    if closed then return pts[((i - 1) % n) + 1] end
+    return pts[clamp(i, 1, n)]
+  end
+  local out = {}
+  local segs = closed and n or n - 1
+  for i = 1, segs do
+    local p0, p1, p2, p3 = P(i - 1), P(i), P(i + 1), P(i + 2)
+    local len = math.sqrt((p2[1] - p1[1]) ^ 2 + (p2[2] - p1[2]) ^ 2)
+    local steps = max(4, math.ceil(len * 3))
+    for k = 0, steps - 1 do
+      local t = k / steps
+      local t2, t3 = t * t, t * t * t
+      local function cr(a, b, c, d) return 0.5 * (2 * b + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3) end
+      out[#out + 1] = { cr(p0[1], p1[1], p2[1], p3[1]), cr(p0[2], p1[2], p2[2], p3[2]), (i - 1 + t) / segs }
+    end
+  end
+  if not closed then out[#out + 1] = { pts[n][1], pts[n][2], 1 } end
+  return out
+end
+
+-- Pixel path along samples: 8-connected, deduplicated, without L-shaped doubled corners.
+local function pixelPath(samples)
+  local path = {}
+  local function add(x, y)
+    local last = path[#path]
+    if not last or last[1] ~= x or last[2] ~= y then path[#path + 1] = { x, y } end
+  end
+  for i, s in ipairs(samples) do
+    local x, y = floor(s[1]), floor(s[2])
+    local last = path[#path]
+    if last and (abs(x - last[1]) > 1 or abs(y - last[2]) > 1) then
+      plotLine(last[1], last[2], x, y, add)
+    else
+      add(x, y)
+    end
+  end
+  -- pixel-perfect: drop a pixel whose neighbors before and after touch diagonally
+  local clean = {}
+  for i = 1, #path do
+    local a, b, c = clean[#clean], path[i], path[i + 1]
+    if a and c and abs(a[1] - c[1]) == 1 and abs(a[2] - c[2]) == 1 and (a[1] == b[1] or a[2] == b[2]) then
+      -- skip b: a and c already connect diagonally
+    else
+      clean[#clean + 1] = b
+    end
+  end
+  return clean
+end
+
+-- Stroke along a spline; width tapers w0 -> w1 (1 = crisp pixel-perfect line).
+local function drawCurve(img, pts, v, w0, w1)
+  w0 = w0 or 1; w1 = w1 or w0
+  local samples = splineSamples(pts, false)
+  if w0 <= 1 and w1 <= 1 then
+    for _, q in ipairs(pixelPath(samples)) do put(img, q[1], q[2], v) end
+    return
+  end
+  for _, s in ipairs(samples) do
+    local r = (w0 + (w1 - w0) * s[3]) / 2
+    local cx, cy = s[1], s[2]
+    for y = floor(cy - r), math.ceil(cy + r) do
+      for x = floor(cx - r), math.ceil(cx + r) do
+        if (x + 0.5 - cx) ^ 2 + (y + 0.5 - cy) ^ 2 <= r * r then put(img, x, y, v) end
+      end
+    end
+  end
+end
+
+-- Smooth closed silhouette through pts: fill, plus an optional 1px inside outline.
+local function drawBlob(img, pts, fillV, lineV)
+  local poly = splineSamples(pts, true)
+  local x0, y0, x1, y1 = math.huge, math.huge, -math.huge, -math.huge
+  for _, q in ipairs(poly) do
+    x0 = min(x0, q[1]); x1 = max(x1, q[1]); y0 = min(y0, q[2]); y1 = max(y1, q[2])
+  end
+  local inside = {}
+  local function test(px, py)
+    local c = false
+    local j = #poly
+    for i = 1, #poly do
+      local xi, yi, xj, yj = poly[i][1], poly[i][2], poly[j][1], poly[j][2]
+      if (yi > py) ~= (yj > py) and px < (xj - xi) * (py - yi) / (yj - yi) + xi then c = not c end
+      j = i
+    end
+    return c
+  end
+  for y = floor(y0), math.ceil(y1) do
+    for x = floor(x0), math.ceil(x1) do
+      if test(x + 0.5, y + 0.5) then inside[y * 100000 + x] = true end
+    end
+  end
+  for k in pairs(inside) do
+    local y, x = k // 100000, k % 100000
+    local edge = not (inside[k - 1] and inside[k + 1] and inside[k - 100000] and inside[k + 100000])
+    put(img, x, y, (edge and lineV) or fillV)
+  end
+end
+
+-- A shaded lobe, the way pixel artists build foliage, clouds, bushes and round bodies: the shape in its
+-- darkest tone, then each lighter tone as a smaller copy shifted toward the light (leaving a crescent of the
+-- previous tone on the shadow side), all with the same scalloped "clump" edge, clipped to the lobe.
+-- o: { light? = "top_left", shift? = 0.45 (how far bands move toward the light, in radii),
+--      shrink? = 0.2 (radius lost per band), bumps? = 7, bumpiness? = 0.12, seed? }
+local function drawLobe(img, codec, cx, cy, rx, ry, colors, o)
+  o = o or {}
+  local L = LIGHT[o.light or "top_left"] or fail("unknown light direction " .. tostring(o.light))
+  local ln = math.sqrt(L[1] ^ 2 + L[2] ^ 2)
+  local lx, ly = ln > 0 and L[1] / ln or 0, ln > 0 and L[2] / ln or 0
+  local bumps, amt = o.bumps or 7, o.bumpiness or 0.12
+  local seed = o.seed or 1
+  local shift, shrink = o.shift or 0.45, o.shrink or 0.2
+  local px = {}
+  for i, c in ipairs(colors) do px[i] = codec.parse(c) end
+  local base = {}
+  for i = 1, #px do
+    local s = 1 - shrink * (i - 1)
+    local brx, bry = rx * s, ry * s
+    local bcx = cx + lx * (1 - s) * rx * shift / max(shrink, 0.01) * shrink
+    local bcy = cy + ly * (1 - s) * ry * shift / max(shrink, 0.01) * shrink
+    local phase = seed * 1.7 + i * 0.9
+    for y = floor(bcy - bry * (1 + amt)) - 1, math.ceil(bcy + bry * (1 + amt)) + 1 do
+      for x = floor(bcx - brx * (1 + amt)) - 1, math.ceil(bcx + brx * (1 + amt)) + 1 do
+        local dx, dy = (x + 0.5 - bcx) / brx, (y + 0.5 - bcy) / bry
+        local th = math.atan(dy, dx)
+        -- scalloped edge: round bumps like leaf clumps
+        local edge = 1 + amt * (abs(math.cos(bumps * th / 2 + phase)) * 2 - 1)
+        if dx * dx + dy * dy <= edge * edge then
+          local k = y * 100000 + x
+          if i == 1 then base[k] = true; put(img, x, y, px[i])
+          elseif base[k] then put(img, x, y, px[i]) end
+        end
+      end
+    end
+  end
+end
+
 -- Shapes, then grid rows, then single pixels.
 function ops.draw(ctx, p)
   return withImage(ctx, p, function(img, codec)
@@ -680,7 +831,13 @@ function ops.draw(ctx, p)
     for i, s in ipairs(p.shapes or {}) do
       local kind = s[1]
       local x1, y1, x2, y2 = s[2], s[3], s[4], s[5]
-      if kind == "gradient" then
+      if kind == "lobe" then
+        drawLobe(img, codec, s[2], s[3], s[4], s[5], s[6], s[7])
+      elseif kind == "curve" then
+        drawCurve(img, s[2], codec.parse(s[3]), s[4], s[5])
+      elseif kind == "blob" then
+        drawBlob(img, s[2], codec.parse(s[3]), s[4] and codec.parse(s[4]) or nil)
+      elseif kind == "gradient" then
         local list = type(s[6]) ~= "string"
         local stops = list and s[6] or { s[6], s[7] }
         local dir = list and s[7] or s[8]
@@ -704,7 +861,7 @@ function ops.draw(ctx, p)
             if edge then put(img, x, y, v) elseif fillV then put(img, x, y, fillV) end
           end)
         else
-          fail("shape " .. i .. ": unknown kind '" .. tostring(kind) .. "' (line|rect|ellipse|gradient)")
+          fail("shape " .. i .. ": unknown kind '" .. tostring(kind) .. "' (line|rect|ellipse|gradient|curve|blob|lobe)")
         end
       end
       n = n + 1
@@ -853,10 +1010,6 @@ function edit.outline(ctx, p)
   end)
 end
 
-local LIGHT = {
-  top_left = { -1, -1 }, top = { 0, -1 }, top_right = { 1, -1 }, left = { -1, 0 },
-  right = { 1, 0 }, bottom_left = { -1, 1 }, bottom = { 0, 1 }, bottom_right = { 1, 1 },
-}
 
 -- Edge shading from a light direction: shadow on edges facing away, highlight on edges facing the light.
 -- Each color region is shaded separately; outline-colored pixels are treated as edges and left alone.
@@ -1148,6 +1301,438 @@ function edit.separate(ctx, p)
     sprite:newCel(bl, frame, bg, Point(0, 0))
   end
   return { moved = n, colors = hexes }
+end
+
+---------------------------------------------------------------------------
+-- Finishing passes: what pixel artists do by hand to un-box primitive shapes
+---------------------------------------------------------------------------
+
+local N4 = { { 0, -1 }, { 1, 0 }, { 0, 1 }, { -1, 0 } }
+
+local function colorSet(codec, list)
+  if not list then return nil end
+  local set = {}
+  for _, c in ipairs(type(list) == "string" and { list } or list) do set[codec.parse(c)] = true end
+  return set
+end
+
+-- Darkest opaque color in the image: the usual outline color.
+local function darkestColor(img, codec)
+  local best, bestL = nil, math.huge
+  local seen = {}
+  for it in img:pixels() do
+    local v = it()
+    if not seen[v] and not codec.clear(v) then
+      seen[v] = true
+      local r, g, b = codec.dec(v)
+      local l = 0.299 * r + 0.587 * g + 0.114 * b
+      if l < bestL then best, bestL = v, l end
+    end
+  end
+  return best
+end
+
+-- The outline color, if there is one: the darkest color, when it is dark and not the only color.
+local function outlineColor(img, codec)
+  local seen, n = {}, 0
+  for it in img:pixels() do
+    local v = it()
+    if not seen[v] and not codec.clear(v) then seen[v] = true; n = n + 1 end
+    if n > 1 then break end
+  end
+  if n < 2 then return nil end
+  local d = darkestColor(img, codec)
+  local r, g, b = codec.dec(d)
+  return (0.299 * r + 0.587 * g + 0.114 * b) < 90 and d or nil
+end
+
+-- Cut convex 90-degree corners off color regions (rect eyes, box heads) so they read round.
+function edit.round(ctx, p)
+  return withImage(ctx, p, function(img, codec)
+    local only = colorSet(codec, p.colors)
+    local n = 0
+    for _ = 1, p.passes or 1 do
+      local src = Image(img)
+      local w, h = img.width, img.height
+      local function at(x, y) if x < 0 or y < 0 or x >= w or y >= h then return codec.none end return src:getPixel(x, y) end
+      for y = 0, h - 1 do
+        for x = 0, w - 1 do
+          local v = src:getPixel(x, y)
+          if not codec.clear(v) and (not only or only[v]) then
+            for _, d in ipairs({ { -1, -1 }, { 1, -1 }, { -1, 1 }, { 1, 1 } }) do
+              local dx, dy = d[1], d[2]
+              local ox, oy = at(x + dx, y), at(x, y + dy)          -- the two outside sides
+              local ix, iy = at(x - dx, y), at(x, y - dy)          -- the two inside sides
+              if ox ~= v and oy ~= v and ix == v and iy == v and at(x - dx, y - dy) == v
+                and at(x - 2 * dx, y) == v and at(x, y - 2 * dy) == v then
+                local diag = at(x + dx, y + dy)
+                img:drawPixel(x, y, (diag == ox or diag == oy) and diag or ox)
+                n = n + 1
+                break
+              end
+            end
+          end
+        end
+      end
+    end
+    return { rounded = n }
+  end)
+end
+
+-- Remove doubled L-corners from 1px lines (Aseprite's "pixel perfect").
+function edit.pixel_perfect(ctx, p)
+  return withImage(ctx, p, function(img, codec)
+    local only = colorSet(codec, p.colors) or { [darkestColor(img, codec) or -1] = true }
+    local w, h = img.width, img.height
+    local n = 0
+    for y = 0, h - 1 do
+      for x = 0, w - 1 do
+        local v = img:getPixel(x, y)
+        if only[v] then
+          local same, hn, vn = 0, 0, 0
+          for dy = -1, 1 do
+            for dx = -1, 1 do
+              if (dx ~= 0 or dy ~= 0) and inb(img, x + dx, y + dy) and img:getPixel(x + dx, y + dy) == v then
+                same = same + 1
+                if dy == 0 then hn = hn + 1 elseif dx == 0 then vn = vn + 1 end
+              end
+            end
+          end
+          if same == 2 and hn == 1 and vn == 1 then
+            -- replace with the majority of the other neighbors
+            local counts, best, bestN = {}, codec.none, 0
+            for _, d in ipairs(N4) do
+              local nx, ny = x + d[1], y + d[2]
+              if inb(img, nx, ny) then
+                local q = img:getPixel(nx, ny)
+                if q ~= v then
+                  counts[q] = (counts[q] or 0) + 1
+                  if counts[q] > bestN then best, bestN = q, counts[q] end
+                end
+              end
+            end
+            img:drawPixel(x, y, best)
+            n = n + 1
+          end
+        end
+      end
+    end
+    return { removed = n }
+  end)
+end
+
+-- Selective outline: outline pixels take a darkened, hue-shifted version of the color they border.
+-- Inner lines soften; the outer edge facing the light gets a lighter variant, the shadow side stays dark.
+function edit.selout(ctx, p)
+  return withImage(ctx, p, function(img, codec)
+    local src = Image(img)
+    local line = p.outline and codec.parse(p.outline) or darkestColor(src, codec)
+    if not line then return { changed = 0 } end
+    local L = LIGHT[p.light or "top_left"] or fail("unknown light direction " .. tostring(p.light))
+    local w, h = img.width, img.height
+    local cache = {}
+    local function variant(v, a)
+      local k = v .. ":" .. a
+      if not cache[k] then
+        local r, g, b = codec.dec(v)
+        local nr, ng, nb = shiftColor(r, g, b, a, p.hueShift)
+        cache[k] = codec.enc(nr, ng, nb, 255)
+      end
+      return cache[k]
+    end
+    local n = 0
+    for y = 0, h - 1 do
+      for x = 0, w - 1 do
+        if src:getPixel(x, y) == line then
+          local counts, fill, best = {}, nil, 0
+          local outer, lit = false, false
+          for _, d in ipairs(N4) do
+            local nx, ny = x + d[1], y + d[2]
+            local q = inb(src, nx, ny) and src:getPixel(nx, ny) or codec.none
+            if codec.clear(q) then
+              outer = true
+              if (d[1] ~= 0 and d[1] == L[1]) or (d[2] ~= 0 and d[2] == L[2]) then lit = true end
+            elseif q ~= line then
+              counts[q] = (counts[q] or 0) + 1
+              if counts[q] > best then fill, best = q, counts[q] end
+            end
+          end
+          if fill then
+            local s = p.strength or 1
+            if not outer then img:drawPixel(x, y, variant(fill, -0.75 * s)); n = n + 1
+            elseif lit then img:drawPixel(x, y, variant(fill, -0.95 * s)); n = n + 1 end
+          end
+        end
+      end
+    end
+    return { changed = n }
+  end)
+end
+
+-- Pass 3, volume: shade each region as a rounded form lit from one direction, banded into a ramp.
+-- Height comes from the distance to the region's edge (a dome over any silhouette), so overlapping
+-- canopy circles, heads and bellies all get believable light without hand-placing it.
+-- p: colors? (which colors are regions; default all opaque except the darkest/outline), ramp? (dark->light),
+--    bands? (auto ramp size, 4), light? (dir), elevation? (1.2), ambient? (0.15), dither? (0..1), roundness? (1)
+function edit.volume(ctx, p)
+  return withImage(ctx, p, function(img, codec)
+    local src = Image(img)
+    local w, h = img.width, img.height
+    local only = colorSet(codec, p.colors)
+    local outline = not only and outlineColor(src, codec) or nil
+    local function inRegionColor(v) return not codec.clear(v) and v ~= outline and (not only or only[v]) end
+    local L = LIGHT[p.light or "top_left"] or fail("unknown light direction " .. tostring(p.light))
+    local lz = p.elevation or 1.2
+    local ln = math.sqrt(L[1] ^ 2 + L[2] ^ 2 + lz ^ 2)
+    local Lx, Ly, Lz = L[1] / ln, L[2] / ln, lz / ln
+    local ambient = p.ambient or 0.15
+    local seen = {}
+    local shaded = 0
+    for y0 = 0, h - 1 do
+      for x0 = 0, w - 1 do
+        local k0 = y0 * w + x0
+        local base = src:getPixel(x0, y0)
+        if not seen[k0] and inRegionColor(base) then
+          -- connected region of this exact color
+          local comp, stack = {}, { k0 }
+          seen[k0] = true
+          local member = {}
+          while #stack > 0 do
+            local k = table.remove(stack)
+            comp[#comp + 1] = k
+            member[k] = true
+            local x, y = k % w, k // w
+            for _, d in ipairs(N4) do
+              local nx, ny = x + d[1], y + d[2]
+              if nx >= 0 and ny >= 0 and nx < w and ny < h then
+                local nk = ny * w + nx
+                if not seen[nk] and src:getPixel(nx, ny) == base then seen[nk] = true; stack[#stack + 1] = nk end
+              end
+            end
+          end
+          if #comp >= (p.minSize or 4) then
+            -- chamfer distance to the region edge
+            local dist = {}
+            for _, k in ipairs(comp) do dist[k] = math.huge end
+            local function relax(k, nk, c) local dn = dist[nk]; if dn and dn + c < dist[k] then dist[k] = dn + c end end
+            for _, k in ipairs(comp) do
+              local x, y = k % w, k // w
+              for _, d in ipairs(N4) do
+                if not member[(y + d[2]) * w + (x + d[1])] or x + d[1] < 0 or x + d[1] >= w then dist[k] = 1 end
+              end
+            end
+            table.sort(comp)
+            for _, k in ipairs(comp) do
+              relax(k, k - 1, 1); relax(k, k - w, 1); relax(k, k - w - 1, 1.4142); relax(k, k - w + 1, 1.4142)
+            end
+            for i = #comp, 1, -1 do
+              local k = comp[i]
+              relax(k, k + 1, 1); relax(k, k + w, 1); relax(k, k + w + 1, 1.4142); relax(k, k + w - 1, 1.4142)
+            end
+            local dmax = 1
+            for _, k in ipairs(comp) do dmax = max(dmax, dist[k]) end
+            local R = dmax * (p.roundness or 1)
+            local function H(k)
+              local d = dist[k]
+              if not d then return 0 end
+              local t = min(d / R, 1)
+              return R * math.sqrt(1 - (1 - t) ^ 2)
+            end
+            -- ramp: given, or hue-shifted around the region's color
+            local ramp = {}
+            if p.ramp then
+              for i, c in ipairs(p.ramp) do ramp[i] = codec.parse(c) end
+            else
+              local r, g, b = codec.dec(base)
+              local nb = p.bands or 4
+              for i = 1, nb do
+                local a = -0.9 + 1.4 * (i - 1) / (nb - 1)
+                local nr, ng, nb2 = shiftColor(r, g, b, a, p.hueShift)
+                ramp[i] = codec.enc(nr, ng, nb2, 255)
+              end
+            end
+            local nb = #ramp
+            local dith = p.dither or 0
+            for _, k in ipairs(comp) do
+              local x, y = k % w, k // w
+              local gx = (H(member[k + 1] and k + 1 or k) - H(member[k - 1] and k - 1 or k)) / 2
+              local gy = (H(member[k + w] and k + w or k) - H(member[k - w] and k - w or k)) / 2
+              local nx, ny, nz = -gx, -gy, 1
+              local nl = math.sqrt(nx * nx + ny * ny + nz * nz)
+              local lit = max(0, (nx * Lx + ny * Ly + nz * Lz) / nl)
+              local I = ambient + (1 - ambient) * lit
+              local idx = floor(I * nb + (bayer(x, y) - 0.5) * dith)
+              img:drawPixel(x, y, ramp[clamp(idx + 1, 1, nb)])
+              shaded = shaded + 1
+            end
+          end
+        end
+      end
+    end
+    return { shaded = shaded }
+  end)
+end
+
+-- Pass 4, detail: stamp small clusters (leaves, grass, bark, scales...) across a region.
+-- Pattern chars: h = one step lighter, m = base, s = one step darker, d = much darker, . = skip.
+-- Each cluster takes its base from the shaded pixel under its center, so details follow the light.
+local PATTERNS = {
+  leaves = {
+    { ".hh.", "hmms", ".ss." },
+    { ".h.", "hms", ".s." },
+    { "hh..", "mhh.", "smms", ".ss." },
+    { ".hhh", "hmm.", "ss.." },
+    { "..h.", ".hms", "hms.", ".s.." },
+  },
+  grass = { { "h.", "m.", "ms" }, { ".h", "sm" }, { "h.h", "msm" }, { ".h.", ".m.", "sms" } },
+  bark = { { "s", "s", "m" }, { "h", "m", "s" }, { "s", "d", "s" }, { "hs" } },
+  scales = { { ".hh.", "hmms", "s..s" }, { "hh", "ms" } },
+  stone = { { "hm", "ms" }, { "hhm", "mss" }, { "h", "s" } },
+  speck = { { "h" }, { "s" } },
+  -- rounded leaf clumps with a lit top edge and a darker underside (tree canopies, bushes)
+  clumps = {
+    { ".hh.", "hmmm", "mmms", ".ss." },
+    { "..hhh..", ".hmmmm.", "hmmmmms", "mmmmmms", ".mmmss." },
+    { ".hhh.", "hmmmm", "mmmms", ".mss." },
+    { "hh.", "mms", ".s." },
+  },
+}
+
+function edit.scatter(ctx, p)
+  return withImage(ctx, p, function(img, codec, sprite)
+    local src = Image(img)
+    local w, h = img.width, img.height
+    local only = colorSet(codec, p.colors)
+    -- the mask: this layer's pixels, or another layer's (e.g. highlights only on top of mid clumps)
+    local mask = src
+    local outline = outlineColor(src, codec)
+    if p.maskLayer then
+      mask = Image(sprite.spec)
+      local mc = resolveLayer(sprite, p.maskLayer):cel(resolveFrame(sprite, p.frame))
+      if mc then mask:drawImage(mc.image, mc.position) end
+      outline = nil
+    end
+    local function inMask(x, y)
+      if not inb(mask, x, y) then return false end
+      local v = mask:getPixel(x, y)
+      return not codec.clear(v) and v ~= outline and (not only or only[v])
+    end
+    -- fixed colors per role instead of tones relative to the pixel below
+    local fixed
+    if p.tones then
+      fixed = {}
+      for role, c in pairs(p.tones) do fixed[role] = codec.parse(c) end
+    end
+    -- light bias: more clusters toward the lit side of the mask
+    local Ld = LIGHT[p.light or "top_left"] or fail("unknown light direction " .. tostring(p.light))
+    local bias = p.lightBias or 0
+    local mx, my, mr = 0, 0, 1
+    if bias > 0 then
+      local n0, x0, y0, x1, y1 = 0, math.huge, math.huge, -math.huge, -math.huge
+      for yy = 0, h - 1 do for xx = 0, w - 1 do
+        if inMask(xx, yy) then n0 = n0 + 1; x0 = min(x0, xx); x1 = max(x1, xx); y0 = min(y0, yy); y1 = max(y1, yy) end
+      end end
+      if n0 > 0 then mx, my, mr = (x0 + x1) / 2, (y0 + y1) / 2, max(1, max(x1 - x0, y1 - y0) / 2) end
+    end
+    local lnorm = math.sqrt(Ld[1] ^ 2 + Ld[2] ^ 2)
+    local function lightWeight(x, y)
+      if bias <= 0 or lnorm == 0 then return 1 end
+      local t = ((x - mx) * Ld[1] + (y - my) * Ld[2]) / (mr * lnorm)
+      return (1 - bias) + bias * clamp((t + 1) / 2, 0, 1)
+    end
+    local variants = p.rows and { p.rows } or PATTERNS[p.pattern or "leaves"]
+      or fail("unknown pattern " .. tostring(p.pattern) .. " (leaves|grass|bark|scales|stone|speck, or rows)")
+    local cache = {}
+    local function tone(v, a)
+      if a == 0 then return v end
+      local key = v .. ":" .. a
+      if not cache[key] then
+        local r, g, b = codec.dec(v)
+        local nr, ng, nb = shiftColor(r, g, b, a, p.hueShift)
+        cache[key] = codec.enc(nr, ng, nb, 255)
+      end
+      return cache[key]
+    end
+    local strength = p.strength or 0.4
+    local ROLE = { h = strength, m = 0, s = -strength, d = -2.2 * strength }
+    -- deterministic LCG so a seed reproduces the same detail
+    local seed = (p.seed or 1) * 2654435761 % 4294967296
+    local function rand()
+      seed = (seed * 1664525 + 1013904223) % 4294967296
+      return seed / 4294967296
+    end
+    local bb = Rectangle(0, 0, w, h)
+    if p.rect then bb = Rectangle(p.rect[1], p.rect[2], p.rect[3] - p.rect[1] + 1, p.rect[4] - p.rect[2] + 1) end
+    local step = p.spacing or 3
+    local density = p.density or 0.6
+    local n = 0
+    for gy = bb.y, bb.y + bb.height - 1, step do
+      for gx = bb.x, bb.x + bb.width - 1, step do
+        local cx = gx + floor(rand() * step)
+        local cy = gy + floor(rand() * step)
+        if rand() < density * lightWeight(cx, cy) then
+          if inMask(cx, cy) then
+            local base = mask:getPixel(cx, cy)
+            local v = variants[1 + floor(rand() * #variants)]
+            local vw, vh = #v[1], #v
+            local ox, oy = cx - vw // 2, cy - vh // 2
+            for ry, line in ipairs(v) do
+              for rx = 1, #line do
+                local ch = line:sub(rx, rx)
+                local a = ROLE[ch]
+                if a then
+                  local x, y = ox + rx - 1, oy + ry - 1
+                  -- inside the mask, or poking 1px past its edge to break the silhouette
+                  local ok = inMask(x, y)
+                  if not ok and p.breakEdge ~= false and inb(src, x, y) and codec.clear(src:getPixel(x, y)) then
+                    for _, d in ipairs(N4) do if inMask(x + d[1], y + d[2]) then ok = true; break end end
+                    ok = ok and ch ~= "s" and ch ~= "d"
+                  end
+                  if ok then
+                    local v2 = fixed and fixed[ch] or (not fixed and tone(base, a)) or nil
+                    if v2 then img:drawPixel(x, y, v2) end
+                  end
+                end
+              end
+            end
+            n = n + 1
+          end
+        end
+      end
+    end
+    return { clusters = n }
+  end)
+end
+
+-- Anti-alias stair-steps: interior pixels cradled by an L of outline get a tone between the two.
+function edit.aa(ctx, p)
+  return withImage(ctx, p, function(img, codec)
+    local src = Image(img)
+    local line = p.outline and codec.parse(p.outline) or darkestColor(src, codec)
+    local amt = p.amount or 0.5
+    local w, h = img.width, img.height
+    local lr, lg, lb = codec.dec(line or 0)
+    local n = 0
+    for y = 0, h - 1 do
+      for x = 0, w - 1 do
+        local v = src:getPixel(x, y)
+        if not codec.clear(v) and v ~= line then
+          local hits = {}
+          for i, d in ipairs(N4) do
+            local nx, ny = x + d[1], y + d[2]
+            if inb(src, nx, ny) and src:getPixel(nx, ny) == line then hits[#hits + 1] = i end
+          end
+          -- exactly two outline sides at right angles (a step corner), and the opposite sides are fill
+          if #hits == 2 and (hits[2] - hits[1]) % 2 == 1 then
+            local r, g, b = codec.dec(v)
+            img:drawPixel(x, y, codec.enc(round(r + (lr - r) * amt), round(g + (lg - g) * amt), round(b + (lb - b) * amt), 255))
+            n = n + 1
+          end
+        end
+      end
+    end
+    return { softened = n }
+  end)
 end
 
 -- Cut a region (rects and/or a char mask) out of a layer onto its own layer: rig a sprite into parts.

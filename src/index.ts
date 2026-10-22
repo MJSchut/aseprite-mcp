@@ -77,9 +77,24 @@ async function extractVideoFrames(
 // MCP server
 // ---------------------------------------------------------------------------
 
+const PASSES_PROMPT = (subject?: string) => `Draw ${subject ?? "the subject"} as pixel art in passes, the way a pixel artist works. One layer per pass, batch the steps of a pass, preview at 4x+ after each pass and fix what reads wrong before moving on.
+
+0. Plan: canvas size, light direction (default top_left), palette: one hue-shifted ramp of 3-5 tones per material (palette ramps), plus one dark outline color. Decide the silhouette and gesture (S-curve, lean, asymmetry) before drawing.
+1. Blockout (layer "blockout"): big silhouette shapes only, in one flat mid tone per material. Use overlapping ellipses/blobs for organic masses (a canopy = 5-9 overlapping round blobs of different sizes; a head = one blob with brow, cheek and snout bumps), curves with taper for limbs, trunks, necks, horns, tails. No rects for living things. Check: is the silhouette readable and interesting as a solid shape?
+2. Color masses: split each material into 2-3 big areas of light and shadow (top/lit side vs underside, ambient occlusion where forms overlap or meet the ground). Big shapes, no noise.
+3. Volume: edit volume per material (colors = that material's flat tone) to turn masses into lit rounded forms; use dither 0.3-0.6 for soft materials (foliage, fur), 0 for hard ones (metal, horn). Overlapping canopy blobs drawn in slightly different mid tones get shaded as separate clumps.
+4. Detail: edit scatter for texture that follows the light (leaves on foliage, bark streaks on trunks, scales, grass, stone), density 0.4-0.8; then hand-draw focal details with draw rows/pixels: eyes as shaped clusters (lid line, pupil, 1px glint), nostrils/mouth carved into the form with shading, claws, highlights on the lit edge. Keep the most contrast and detail at the focal point (face), less elsewhere.
+5. Finish: edit outline (auto, darker neighbor color) -> selout (lighter outline on the lit side, softer inner lines) -> aa (soften stair-steps on curves) -> pixel_perfect (no doubled corners); round any region that still reads boxy. Remove orphan pixels, check the palette (sprite_info palette=true) has no near-duplicate colors.
+6. Review: preview at 1x and 4x. Ask: does it read at 1x? Is the light consistent? Do any straight parallel lines or perfect rectangles remain on organic forms? Fix by hand.
+
+For animation, keep parts (head, jaw, limbs, tail) on their own layers from the blockout on, and draw alternate poses on extra source frames for animate pose tracks.`;
+
 async function startServer() {
   const INSTRUCTIONS = `Aseprite pixel art. Coords 0-based from top-left; frames 1-based. Colors "#rgb" "#rrggbb" "#rrggbbaa" "transparent". Drawing replaces pixels.
-Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or palette ramps), big shapes first with draw, then edit outline/shade, check preview, refine with read_pixels. Separate layers per part (body, head, eyes...) so animate can move them independently. Use batch for many edits. Animate static art with animate presets; export sheets for games.`;
+Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or palette ramps, 3-4 hue-shifted tones per material), one light direction. Draw, don't assemble: silhouettes from blob/curve (not rect/ellipse), S-curves and taper over straight parallel lines, asymmetry; shape features into the form (brow over eyes, snout as part of the head) instead of pasting shapes on top; eyes as small shaped clusters (lid line, pupil, 1px glint). Work in passes, one layer each, preview after every pass (prompt pixel_art_passes has the full method):
+1 blockout: silhouettes from blob/ellipse/curve, flat mid color; 2 color masses: big light/shadow areas, 2-3 tones per material;
+3 volume: edit volume (forms lit from one direction, hue-shifted ramp); 4 detail: edit scatter (leaf/grass/bark/scale clusters following the light) + hand-placed details;
+5 finish: edit outline -> selout -> aa -> pixel_perfect, round where shapes read boxy. Fix by hand with read_pixels/draw rows. Use batch for many edits; separate part layers so animate can move them.`;
 
   const server = new McpServer({ name: "aseprite-mcp", version: "2.0.0" }, { instructions: INSTRUCTIONS });
 
@@ -181,11 +196,17 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
       description:
         "Draw on a layer, in order: shapes, rows, pixels. " +
         "shapes: [kind,x1,y1,x2,y2,color,fill?] kind line|rect|ellipse (fill = interior color); " +
+        '["curve",[[x,y],...],color,w0?,w1?] smooth spline through points, tapering width (1 = crisp pixel-perfect line); ' +
+        '["blob",[[x,y],...],fill,outline?] smooth closed silhouette through points (heads, bodies, snouts); ' +
+        '["lobe",cx,cy,rx,ry,[dark..light colors],{light?,shift?=0.45,shrink?=0.2,bumps?=7,bumpiness?=0.12,seed?}] shaded form: ' +
+        "each lighter tone a smaller copy shifted toward the light, scalloped clump edges (tree = ~3 lobes, back first; bushes, clouds, round bodies); " +
         'or ["gradient",x1,y1,x2,y2,[colors...],"v"|"h"|"r"] (Bayer-dithered). ' +
         "rows: char grid, legend maps char->color, '.'/space skipped; x,y offset rows. pixels: [[x,y,color]...].",
       inputSchema: {
         path,
-        shapes: z.array(z.array(z.union([z.string(), int, z.array(z.string())]))).optional(),
+        shapes: z
+          .array(z.array(z.union([z.string(), int, z.array(z.string()), z.array(z.array(int)), z.record(z.string(), z.unknown())])))
+          .optional(),
         rows: z.array(z.string()).optional(),
         legend: z.record(z.string(), color).optional(),
         x: int.optional(),
@@ -210,10 +231,18 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
         "copy{x,y,width,height,toX,toY,fromLayer?,fromFrame?,flip?:h|v} | shift{dx,dy,wrap?} | " +
         "split{toLayer, rects?:[[x1,y1,x2,y2]], rows?(mask, x,y), below?, backfill?=1} (cut a part onto its own layer for rigging: head, torso, arm_l, arm_r, leg_l, leg_r) | " +
         "separate{colors?(default: border colors), seeds?:[[x,y]], toLayer?=\"background\"|false, islands?=6, fillHole?=true} (split background from subject) | " +
-        'quantize{palette?: hex list|preset|"sprite", dither?:none|bayer|fs, strength? 0-1, setPalette?} (pull colors to a palette)',
+        'quantize{palette?: hex list|preset|"sprite", dither?:none|bayer|fs, strength? 0-1, setPalette?} (pull colors to a palette) | ' +
+        "finishing: round{colors?,passes?} (cut box corners) | selout{outline?,light?,strength?} (outline tinted from what it borders) | " +
+        "aa{outline?,amount?=0.5} (soften stair-steps) | pixel_perfect{colors?} (remove doubled line corners); outline defaults to darkest color | " +
+        "volume{colors?,ramp?(dark->light)|bands?=4,light?,elevation?=1.2,ambient?=0.15,dither?=0..1,roundness?} (shade each region as a lit rounded form) | " +
+        "scatter{pattern?:clumps|leaves|grass|bark|scales|stone|speck | rows (h lighter,m base,s darker,d dark), tones?:{h,m,s,d: color} (fixed colors), " +
+        "maskLayer? (place only over that layer), lightBias?=0..1 (denser on the lit side), density?=0.6, spacing?=3, strength?=0.4, colors?, rect?, seed?, breakEdge?=true} (detail clusters following the light)",
       inputSchema: z.looseObject({
         path,
-        action: z.enum(["fill", "replace", "mirror", "outline", "shade", "copy", "shift", "quantize", "separate", "split"]),
+        action: z.enum([
+          "fill", "replace", "mirror", "outline", "shade", "copy", "shift", "quantize", "separate", "split",
+          "round", "selout", "aa", "pixel_perfect", "volume", "scatter",
+        ]),
         layer,
         frame,
         preview,
@@ -534,6 +563,18 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
         if (tmp) await rm(tmp, { recursive: true, force: true });
       }
     },
+  );
+
+  server.registerPrompt(
+    "pixel_art_passes",
+    {
+      title: "Pixel art in passes",
+      description: "The multi-pass method for drawing a sprite or prop that looks hand-made instead of assembled from primitives.",
+      argsSchema: { subject: z.string().optional().describe("what to draw, e.g. an oak tree, a horned wyrm") },
+    },
+    ({ subject }) => ({
+      messages: [{ role: "user", content: { type: "text", text: PASSES_PROMPT(subject) } }],
+    }),
   );
 
   const BATCH_OPS = [

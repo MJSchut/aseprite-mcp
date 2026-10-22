@@ -425,3 +425,83 @@ test("pose track swaps a layer to an alternate drawing; layers without one keep 
   assert.equal(f2.rows[5][5], ".", "rest arm gone in pose 2");
   assert.equal(at(f2, 1, 1), "#ff0000", "body has no pose-2 drawing, keeps rest");
 });
+
+test("organic shapes: lobe bands toward the light, pixel-perfect curves, blobs with outline", opts, async () => {
+  const f = join(dir, "shapes.aseprite");
+  await call("batch", {
+    path: f,
+    steps: [
+      { op: "create_sprite", width: 32, height: 32 },
+      { op: "draw", shapes: [["lobe", 16, 16, 12, 10, ["#111111", "#555555", "#999999", "#dddddd"], { seed: 2 }]] },
+    ],
+  });
+  const g = await grid(f);
+  const centroid = (hex) => {
+    const ch = Object.keys(g.legend).find((c) => g.legend[c] === hex);
+    let sx = 0, sy = 0, n = 0;
+    g.rows.forEach((r, y) => [...r].forEach((c, x) => { if (c === ch) { sx += x; sy += y; n++; } }));
+    return [sx / n, sy / n];
+  };
+  const dark = centroid("#111111"), light = centroid("#dddddd");
+  assert.ok(light[0] < dark[0] && light[1] < dark[1], "light band sits toward the top-left light");
+  assert.equal(Object.keys(g.legend).length, 4);
+
+  const c = join(dir, "curve.aseprite");
+  await call("batch", {
+    path: c,
+    steps: [
+      { op: "create_sprite", width: 24, height: 24 },
+      { op: "draw", shapes: [["curve", [[2, 20], [8, 6], [16, 18], [22, 3]], "#000000"], ["blob", [[3, 3], [9, 2], [10, 8], [4, 9]], "#ff0000", "#000000"]] },
+    ],
+  });
+  const cg = await grid(c);
+  const filled = (x, y) => cg.rows[y]?.[x] !== undefined && cg.rows[y][x] !== ".";
+  const k = Object.keys(cg.legend).find((ch) => cg.legend[ch] === "#000000");
+  let lCorners = 0;
+  cg.rows.forEach((r, y) => [...r].forEach((ch, x) => {
+    if (ch !== k || x < 11) return; // the curve part only (blob is left/top)
+    const same = (dx, dy) => cg.rows[y + dy]?.[x + dx] === k;
+    if ((same(1, 0) || same(-1, 0)) && (same(0, 1) || same(0, -1))) {
+      const n8 = [-1, 0, 1].flatMap((dy) => [-1, 0, 1].map((dx) => (dx || dy) && same(dx, dy))).filter(Boolean).length;
+      if (n8 === 2) lCorners++;
+    }
+  }));
+  assert.equal(lCorners, 0, "1px curve has no doubled L-corners");
+  assert.ok(filled(6, 5), "blob is filled");
+  assert.ok(Object.values(cg.legend).includes("#ff0000"));
+});
+
+test("finishing passes: round, pixel_perfect, selout, aa, volume, scatter", opts, async () => {
+  const f = join(dir, "finish.aseprite");
+  const r = await call("batch", {
+    path: f,
+    steps: [
+      { op: "create_sprite", width: 24, height: 24, layerName: "art" },
+      { op: "draw", shapes: [["rect", 4, 4, 15, 13, "#3366cc", "#3366cc"]] },
+      { op: "edit", action: "round" },
+      { op: "edit", action: "volume", bands: 3 },
+      { op: "edit", action: "outline", color: "#101018" },
+      { op: "edit", action: "selout" },
+      { op: "edit", action: "aa" },
+      // an L of two 1px lines: the corner pixel is redundant (its neighbors already touch diagonally)
+      { op: "draw", shapes: [["line", 18, 18, 22, 18, "#202030"], ["line", 22, 18, 22, 22, "#202030"]] },
+      { op: "edit", action: "pixel_perfect", colors: ["#202030"] },
+      { op: "layer", action: "add", name: "leaves" },
+      { op: "edit", action: "scatter", layer: "leaves", maskLayer: "art", pattern: "clumps", tones: { h: "#00ff00", m: "#00aa00" }, density: 1, seed: 4 },
+    ],
+  });
+  const res = text(r).split("\n").map((l) => { const v = l.slice(l.indexOf(":") + 1); return v === "ok" ? true : JSON.parse(v); });
+  assert.equal(res[2].rounded, 4, "four box corners cut");
+  assert.ok(res[3].shaded > 50);
+  assert.ok(res[5].changed > 0, "selout recolored outline pixels");
+  assert.equal(res[8].removed, 1, "doubled corner removed");
+  assert.ok(res[10].clusters > 0);
+  const leaves = await grid(f, { layer: "leaves" });
+  assert.deepEqual(new Set(Object.values(leaves.legend)), new Set(["#00ff00", "#00aa00"]), "scatter used only the given tones");
+  const art = await grid(f, { layer: "art" });
+  leaves.rows.forEach((row, y) => [...row].forEach((ch, x) => {
+    if (ch === ".") return;
+    const near = [-1, 0, 1].some((dy) => [-1, 0, 1].some((dx) => (art.rows[y + dy]?.[x + dx] ?? ".") !== "."));
+    assert.ok(near, `leaf pixel ${x},${y} stays within 1px of the mask`);
+  }));
+});
