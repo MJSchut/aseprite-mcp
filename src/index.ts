@@ -94,7 +94,7 @@ async function startServer() {
 Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or palette ramps, 3-4 hue-shifted tones per material), one light direction. Draw, don't assemble: silhouettes from blob/curve (not rect/ellipse), S-curves and taper over straight parallel lines, asymmetry; shape features into the form (brow over eyes, snout as part of the head) instead of pasting shapes on top; eyes as small shaped clusters (lid line, pupil, 1px glint). Work in passes, one layer each, preview after every pass (prompt pixel_art_passes has the full method):
 1 blockout: silhouettes from blob/ellipse/curve, flat mid color; 2 color masses: big light/shadow areas, 2-3 tones per material;
 3 volume: edit volume (forms lit from one direction, hue-shifted ramp); 4 detail: edit scatter (leaf/grass/bark/scale clusters following the light) + hand-placed details;
-5 finish: edit outline -> selout -> aa -> pixel_perfect, round where shapes read boxy. Fix by hand with read_pixels/draw rows. Use batch for many edits; separate part layers so animate can move them.`;
+5 finish: edit simplify (no noise) -> outline -> selout -> pixel_perfect, round where shapes read boxy. Aim between simple and detailed: 3 tones per material, clean clusters, detail only at the focal point. Fix by hand with read_pixels/draw rows. Use batch for many edits; separate part layers so animate can move them.`;
 
   const server = new McpServer({ name: "aseprite-mcp", version: "2.0.0" }, { instructions: INSTRUCTIONS });
 
@@ -197,7 +197,9 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
         "Draw on a layer, in order: shapes, rows, pixels. " +
         "shapes: [kind,x1,y1,x2,y2,color,fill?] kind line|rect|ellipse (fill = interior color); " +
         '["curve",[[x,y],...],color,w0?,w1?] smooth spline through points, tapering width (1 = crisp pixel-perfect line); ' +
-        '["blob",[[x,y],...],fill,outline?] smooth closed silhouette through points (heads, bodies, snouts); ' +
+        '["blob",[[x,y],...],fill,outline?] smooth closed silhouette through points (heads, bodies, snouts); a point [x,y,1] is a sharp corner (brims, hems, ears); ' +
+        '["tube",[[x,y],...],[dark..light],w0,w1?,{light?,contrast?,bias?}] shaded tapered cylinder (limbs, hair locks, horns, necks, tails; w1=0 for a point); ' +
+        '["form",[[x,y(,1)],...],[dark..light],{light?,shrink?=0.18,shift?=0.5}] blob silhouette shaded with clean crescents (heads, snouts, bodies, rocks); ' +
         '["lobe",cx,cy,rx,ry,[dark..light colors],{light?,shift?=0.45,shrink?=0.2,bumps?=7,bumpiness?=0.12,seed?}] shaded form: ' +
         "each lighter tone a smaller copy shifted toward the light, scalloped clump edges (tree = ~3 lobes, back first; bushes, clouds, round bodies); " +
         'or ["gradient",x1,y1,x2,y2,[colors...],"v"|"h"|"r"] (Bayer-dithered). ' +
@@ -234,6 +236,7 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
         'quantize{palette?: hex list|preset|"sprite", dither?:none|bayer|fs, strength? 0-1, setPalette?} (pull colors to a palette) | ' +
         "finishing: round{colors?,passes?} (cut box corners) | selout{outline?,light?,strength?} (outline tinted from what it borders) | " +
         "aa{outline?,amount?=0.5} (soften stair-steps) | pixel_perfect{colors?} (remove doubled line corners); outline defaults to darkest color | " +
+        "simplify{minSize?=2,passes?=2,keep?:colors} (merge orphan pixels/tiny clusters: removes shading noise; run before 1px details) | " +
         "volume{colors?,ramp?(dark->light)|bands?=4,light?,elevation?=1.2,ambient?=0.15,dither?=0..1,roundness?} (shade each region as a lit rounded form) | " +
         "scatter{pattern?:clumps|leaves|grass|bark|scales|stone|speck | rows (h lighter,m base,s darker,d dark), tones?:{h,m,s,d: color} (fixed colors), " +
         "maskLayer? (place only over that layer), lightBias?=0..1 (denser on the lit side), density?=0.6, spacing?=3, strength?=0.4, colors?, rect?, seed?, breakEdge?=true} (detail clusters following the light)",
@@ -241,7 +244,7 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
         path,
         action: z.enum([
           "fill", "replace", "mirror", "outline", "shade", "copy", "shift", "quantize", "separate", "split",
-          "round", "selout", "aa", "pixel_perfect", "volume", "scatter",
+          "round", "selout", "aa", "pixel_perfect", "volume", "scatter", "simplify",
         ]),
         layer,
         frame,

@@ -505,3 +505,22 @@ test("finishing passes: round, pixel_perfect, selout, aa, volume, scatter", opts
     assert.ok(near, `leaf pixel ${x},${y} stays within 1px of the mask`);
   }));
 });
+
+test("form shades any silhouette with clean crescents; simplify merges orphan pixels", opts, async () => {
+  const f = join(dir, "form.aseprite");
+  const r = await call("batch", {
+    path: f,
+    steps: [
+      { op: "create_sprite", width: 24, height: 24 },
+      { op: "draw", shapes: [["form", [[4, 6, 1], [12, 3], [20, 6, 1], [19, 17], [12, 21], [5, 17]], ["#222244", "#4444aa", "#8888ee"]]] },
+      { op: "draw", pixels: [[12, 12, "#ff0000"]] },
+      { op: "edit", action: "simplify" },
+    ],
+  });
+  assert.match(text(r).split("\n")[3], /"merged":1/);
+  const g = await grid(f);
+  assert.deepEqual(new Set(Object.values(g.legend)), new Set(["#222244", "#4444aa", "#8888ee"]), "orphan red pixel merged away");
+  const at = (x, y) => g.legend[g.rows[y][x]];
+  assert.equal(at(18, 16), "#222244", "shadow crescent on the bottom-right");
+  assert.equal(at(9, 8), "#8888ee", "light toward the top-left");
+});

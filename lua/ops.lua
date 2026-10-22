@@ -695,6 +695,9 @@ local function splineSamples(pts, closed)
   local segs = closed and n or n - 1
   for i = 1, segs do
     local p0, p1, p2, p3 = P(i - 1), P(i), P(i + 1), P(i + 2)
+    -- a point with a truthy 3rd value is a sharp corner: no tangent through it
+    if p1[3] and p1[3] ~= 0 then p0 = p1 end
+    if p2[3] and p2[3] ~= 0 then p3 = p2 end
     local len = math.sqrt((p2[1] - p1[1]) ^ 2 + (p2[2] - p1[2]) ^ 2)
     local steps = max(4, math.ceil(len * 3))
     for k = 0, steps - 1 do
@@ -753,6 +756,91 @@ local function drawCurve(img, pts, v, w0, w1)
         if (x + 0.5 - cx) ^ 2 + (y + 0.5 - cy) ^ 2 <= r * r then put(img, x, y, v) end
       end
     end
+  end
+end
+
+-- Shaded tube along a spline: a tapered cylinder (limbs, hair locks, horns, necks, tails, hat cones).
+-- Width tapers w0 -> w1 (0 = pointed tip); each pixel's tone comes from how its side faces the light.
+local function drawTube(img, codec, pts, colors, w0, w1, o)
+  o = o or {}
+  local L = LIGHT[o.light or "top_left"] or fail("unknown light direction " .. tostring(o.light))
+  local ln = math.sqrt(L[1] ^ 2 + L[2] ^ 2)
+  local lx, ly = ln > 0 and L[1] / ln or 0, ln > 0 and L[2] / ln or 0
+  local px = {}
+  for i, c in ipairs(colors) do px[i] = codec.parse(c) end
+  local nb = #px
+  local samples = splineSamples(pts, false)
+  w1 = w1 or w0
+  local x0, y0, x1, y1 = math.huge, math.huge, -math.huge, -math.huge
+  for _, sm in ipairs(samples) do
+    sm[4] = max(0.25, (w0 + (w1 - w0) * sm[3]) / 2)
+    x0 = min(x0, sm[1] - sm[4]); x1 = max(x1, sm[1] + sm[4]); y0 = min(y0, sm[2] - sm[4]); y1 = max(y1, sm[2] + sm[4])
+  end
+  for y = floor(y0), math.ceil(y1) do
+    for x = floor(x0), math.ceil(x1) do
+      local cx, cy = x + 0.5, y + 0.5
+      local best, bd = nil, math.huge
+      for _, sm in ipairs(samples) do
+        local d = (cx - sm[1]) ^ 2 + (cy - sm[2]) ^ 2 - sm[4] * sm[4]
+        if d < bd then best, bd = sm, d end
+      end
+      if bd <= 0 then
+        local r = best[4]
+        local ox, oy = (cx - best[1]) / r, (cy - best[2]) / r
+        -- round cross-section: facing the light = lighter; edge away from it = darkest
+        local face = ox * lx + oy * ly
+        local I = clamp((face + 1) / 2 * (o.contrast or 1) + (o.bias or 0.1), 0, 0.999)
+        put(img, x, y, px[1 + floor(I * nb)])
+      end
+    end
+  end
+end
+
+-- Pixels inside a closed spline (pixel centers), as a set keyed y*100000+x.
+local function splineMask(pts)
+  local poly = splineSamples(pts, true)
+  local x0, y0, x1, y1 = math.huge, math.huge, -math.huge, -math.huge
+  for _, q in ipairs(poly) do
+    x0 = min(x0, q[1]); x1 = max(x1, q[1]); y0 = min(y0, q[2]); y1 = max(y1, q[2])
+  end
+  local inside = {}
+  for y = floor(y0), math.ceil(y1) do
+    for x = floor(x0), math.ceil(x1) do
+      local px, py, c = x + 0.5, y + 0.5, false
+      local j = #poly
+      for i = 1, #poly do
+        local xi, yi, xj, yj = poly[i][1], poly[i][2], poly[j][1], poly[j][2]
+        if (yi > py) ~= (yj > py) and px < (xj - xi) * (py - yi) / (yj - yi) + xi then c = not c end
+        j = i
+      end
+      if c then inside[y * 100000 + x] = true end
+    end
+  end
+  return inside
+end
+
+-- A shaded form from any silhouette (heads, snouts, bodies, rocks): the shape in its darkest tone, then each
+-- lighter tone a smaller copy shifted toward the light, clipped to the shape. Clean crescents, no noise.
+local function drawForm(img, codec, pts, colors, o)
+  o = o or {}
+  local L = LIGHT[o.light or "top_left"] or fail("unknown light direction " .. tostring(o.light))
+  local ln = math.sqrt(L[1] ^ 2 + L[2] ^ 2)
+  local lx, ly = ln > 0 and L[1] / ln or 0, ln > 0 and L[2] / ln or 0
+  local cx, cy, rx, ry = 0, 0, 0, 0
+  for _, q in ipairs(pts) do cx = cx + q[1]; cy = cy + q[2] end
+  cx, cy = cx / #pts, cy / #pts
+  for _, q in ipairs(pts) do rx = max(rx, abs(q[1] - cx)); ry = max(ry, abs(q[2] - cy)) end
+  local shrink, shift = o.shrink or 0.18, o.shift or 0.5
+  local base
+  for i, c in ipairs(colors) do
+    local v = codec.parse(c)
+    local s = 1 - shrink * (i - 1)
+    local dx, dy = lx * rx * (1 - s) * shift * 2, ly * ry * (1 - s) * shift * 2
+    local scaled = {}
+    for k, q in ipairs(pts) do scaled[k] = { cx + (q[1] - cx) * s + dx, cy + (q[2] - cy) * s + dy, q[3] } end
+    local m = splineMask(scaled)
+    if i == 1 then base = m end
+    for k in pairs(m) do if base[k] then put(img, k % 100000, k // 100000, v) end end
   end
 end
 
@@ -831,7 +919,11 @@ function ops.draw(ctx, p)
     for i, s in ipairs(p.shapes or {}) do
       local kind = s[1]
       local x1, y1, x2, y2 = s[2], s[3], s[4], s[5]
-      if kind == "lobe" then
+      if kind == "form" then
+        drawForm(img, codec, s[2], s[3], s[4])
+      elseif kind == "tube" then
+        drawTube(img, codec, s[2], s[3], s[4] or 3, s[5], s[6])
+      elseif kind == "lobe" then
         drawLobe(img, codec, s[2], s[3], s[4], s[5], s[6], s[7])
       elseif kind == "curve" then
         drawCurve(img, s[2], codec.parse(s[3]), s[4], s[5])
@@ -861,7 +953,7 @@ function ops.draw(ctx, p)
             if edge then put(img, x, y, v) elseif fillV then put(img, x, y, fillV) end
           end)
         else
-          fail("shape " .. i .. ": unknown kind '" .. tostring(kind) .. "' (line|rect|ellipse|gradient|curve|blob|lobe)")
+          fail("shape " .. i .. ": unknown kind '" .. tostring(kind) .. "' (line|rect|ellipse|gradient|curve|blob|lobe|tube|form)")
         end
       end
       n = n + 1
@@ -1344,6 +1436,62 @@ local function outlineColor(img, codec)
   local d = darkestColor(img, codec)
   local r, g, b = codec.dec(d)
   return (0.299 * r + 0.587 * g + 0.114 * b) < 90 and d or nil
+end
+
+-- Clean clusters: merge orphan pixels and clusters smaller than minSize into their surroundings.
+-- Removes the speckle that procedural shading leaves behind; run it before hand-placed 1px details.
+function edit.simplify(ctx, p)
+  return withImage(ctx, p, function(img, codec)
+    local minSize = p.minSize or 2
+    local keep = colorSet(codec, p.keep)
+    local w, h = img.width, img.height
+    local n = 0
+    for _ = 1, p.passes or 2 do
+      local src = Image(img)
+      local seen = {}
+      for y0 = 0, h - 1 do
+        for x0 = 0, w - 1 do
+          local k0 = y0 * w + x0
+          local v = src:getPixel(x0, y0)
+          if not seen[k0] and not codec.clear(v) then
+            local comp, stack = {}, { k0 }
+            seen[k0] = true
+            while #stack > 0 and #comp < minSize do
+              local k = table.remove(stack)
+              comp[#comp + 1] = k
+              local x, y = k % w, k // w
+              for _, d in ipairs(N4) do
+                local nx, ny = x + d[1], y + d[2]
+                if nx >= 0 and ny >= 0 and nx < w and ny < h then
+                  local nk = ny * w + nx
+                  if not seen[nk] and src:getPixel(nx, ny) == v then seen[nk] = true; stack[#stack + 1] = nk end
+                end
+              end
+            end
+            if #comp < minSize and #stack == 0 and not (keep and keep[v]) then
+              for _, k in ipairs(comp) do
+                local x, y = k % w, k // w
+                local counts, best, bestN = {}, nil, 0
+                for _, d in ipairs(N4) do
+                  local nx, ny = x + d[1], y + d[2]
+                  if nx >= 0 and ny >= 0 and nx < w and ny < h then
+                    local q = src:getPixel(nx, ny)
+                    if q ~= v and not codec.clear(q) then
+                      counts[q] = (counts[q] or 0) + 1
+                      if counts[q] > bestN then best, bestN = q, counts[q] end
+                    end
+                  end
+                end
+                -- only merge when surrounded mostly by one color (keeps silhouette edges and line ends)
+                if best and bestN >= 3 then img:drawPixel(x, y, best); n = n + 1 end
+              end
+            end
+          end
+        end
+      end
+    end
+    return { merged = n }
+  end)
 end
 
 -- Cut convex 90-degree corners off color regions (rect eyes, box heads) so they read round.
