@@ -844,6 +844,76 @@ local function drawForm(img, codec, pts, colors, o)
   end
 end
 
+-- An eye with real anatomy instead of a circle or box: flatter lower lid, angular inner corner (nose side),
+-- upper lid arching over to a rounded outer corner, heavier top lid line, pupil tucked under the lid.
+-- c: { fill, lid, lower?, pupil?, glint? }   o: { nose = "right"|"left" (inner corner side), arch? 0..1,
+--    flat? 0..1 (lower lid flatness), tilt? px (inner corner drop), lidWidth? 1|2, pupil = { w, h, dx, dy, slit? },
+--    light? (glint side) }
+local function drawEye(img, codec, cx, cy, w, h, c, o)
+  o = o or {}
+  -- tiny eyes (distant or small characters: 1x2, 2x1, 2x2, 3x2...): no room for anatomy. A dark block with
+  -- the glint on the light side, never mirrored with the nose side, so every eye in a scene catches the same light.
+  if w <= 3 and h <= 3 then
+    local L = LIGHT[o.light or "top_left"] or LIGHT.top_left
+    local x0, y0 = round(cx - w / 2), round(cy - h / 2)
+    local dark = codec.parse(c.pupil or c.lid)
+    for y = 0, h - 1 do for x = 0, w - 1 do put(img, x0 + x, y0 + y, dark) end end
+    if c.glint and h >= 2 then
+      local gx = (w == 1) and 0 or (L[1] > 0 and w - 1 or 0)
+      local gy = L[2] > 0 and h - 1 or 0
+      put(img, x0 + gx, y0 + gy, codec.parse(c.glint))
+    end
+    return
+  end
+  local sgn = (o.nose or "right") == "right" and 1 or -1     -- +x points toward the nose
+  local arch, flat, tilt = o.arch or 0.4, o.flat or 0.7, o.tilt or h * 0.15
+  local hw, hh = w / 2, h / 2
+  local function P(x, y, corner) return { cx + sgn * x, cy + y, corner and 1 or nil } end
+  local pts = {
+    P(hw, tilt, true),                                        -- inner corner: a point, slightly low
+    P(hw * 0.45, -hh * (0.75 + arch * 0.15)),                 -- upper lid rises from the inner corner...
+    P(-hw * (0.05 + arch * 0.25), -hh * (1.0 + arch * 0.1)),  -- ...peaks toward the outer side...
+    P(-hw * 0.85, -hh * 0.55),                                -- ...and rounds over
+    P(-hw, hh * 0.05),                                        -- outer corner: round
+    P(-hw * 0.65, hh * (0.8 + (1 - flat) * 0.25)),
+    P(hw * 0.2, hh * (0.85 + (1 - flat) * 0.3)),              -- lower lid: nearly flat
+  }
+  local mask = splineMask(pts)
+  local fill = codec.parse(c.fill)
+  local lid = codec.parse(c.lid)
+  local lower = c.lower and codec.parse(c.lower) or lid
+  local lw = o.lidWidth or (h >= 6 and 2 or 1)
+  local function inside(x, y) return mask[y * 100000 + x] end
+  for k in pairs(mask) do put(img, k % 100000, k // 100000, fill) end
+  -- pupil, clipped to the eye
+  if c.pupil then
+    local pp = o.pupil or {}
+    local pw, ph = pp.w or max(1, w * 0.22), pp.h or h * 0.7
+    local px0, py0 = cx + sgn * (pp.dx or 0), cy + (pp.dy or -h * 0.08)
+    local pv = codec.parse(c.pupil)
+    for k in pairs(mask) do
+      local x, y = k % 100000, k // 100000
+      local nx, ny = (x + 0.5 - px0) / (pw / 2), (y + 0.5 - py0) / (ph / 2)
+      if nx * nx + ny * ny <= 1 then put(img, x, y, pv) end
+    end
+    if c.glint then
+      local L = LIGHT[o.light or "top_left"] or LIGHT.top_left
+      local gx = floor(px0 + L[1] * max(1, pw / 2))
+      local gy = floor(py0 + L[2] * max(1, ph / 4))
+      if inside(gx, gy) then put(img, gx, gy, codec.parse(c.glint)) end
+      if ph >= 5 and inside(gx, gy + 1) then put(img, gx, gy + 1, codec.parse(c.glint)) end
+    end
+  end
+  -- lids: heavy top line (lw px), lighter bottom line, outline at the corners
+  for k in pairs(mask) do
+    local x, y = k % 100000, k // 100000
+    local top = not inside(x, y - 1) or (lw >= 2 and not inside(x, y - 2))
+    if top then put(img, x, y, lid)
+    elseif not inside(x, y + 1) then put(img, x, y, lower)
+    elseif not inside(x - 1, y) or not inside(x + 1, y) then put(img, x, y, lid) end
+  end
+end
+
 -- Smooth closed silhouette through pts: fill, plus an optional 1px inside outline.
 local function drawBlob(img, pts, fillV, lineV)
   local poly = splineSamples(pts, true)
@@ -919,7 +989,9 @@ function ops.draw(ctx, p)
     for i, s in ipairs(p.shapes or {}) do
       local kind = s[1]
       local x1, y1, x2, y2 = s[2], s[3], s[4], s[5]
-      if kind == "form" then
+      if kind == "eye" then
+        drawEye(img, codec, s[2], s[3], s[4], s[5], s[6], s[7])
+      elseif kind == "form" then
         drawForm(img, codec, s[2], s[3], s[4])
       elseif kind == "tube" then
         drawTube(img, codec, s[2], s[3], s[4] or 3, s[5], s[6])
@@ -953,7 +1025,7 @@ function ops.draw(ctx, p)
             if edge then put(img, x, y, v) elseif fillV then put(img, x, y, fillV) end
           end)
         else
-          fail("shape " .. i .. ": unknown kind '" .. tostring(kind) .. "' (line|rect|ellipse|gradient|curve|blob|lobe|tube|form)")
+          fail("shape " .. i .. ": unknown kind '" .. tostring(kind) .. "' (line|rect|ellipse|gradient|curve|blob|lobe|tube|form|eye)")
         end
       end
       n = n + 1
@@ -2112,6 +2184,25 @@ function ops.preview(ctx, p)
         end
       end
     end
+  end
+  -- reference side by side (same displayed height) to steer each pass toward a target look
+  if p.reference then
+    local rs = openImage(p.reference)
+    local ref = renderRGB(rs, 1)
+    rs:close()
+    if p.referenceRect then
+      local r = p.referenceRect
+      ref = Image(ref, Rectangle(r[1], r[2], r[3], r[4]))
+    end
+    local th = out.height
+    local tw = max(1, round(ref.width * th / ref.height))
+    local ok = pcall(function() ref:resize { width = tw, height = th, method = ref.height > th and "bilinear" or "nearest" } end)
+    if not ok then ref:resize { width = tw, height = th } end
+    local both = Image(tw + 8 + out.width, th, ColorMode.RGB)
+    both:clear(pc.rgba(40, 40, 48, 255))
+    both:drawImage(ref, Point(0, 0))
+    both:drawImage(out, Point(tw + 8, 0))
+    out = both
   end
   out:saveAs(p.output)
   return { w = out.width, h = out.height, scale = s }

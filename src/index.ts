@@ -83,7 +83,7 @@ const PASSES_PROMPT = (subject?: string) => `Draw ${subject ?? "the subject"} as
 1. Blockout (layer "blockout"): big silhouette shapes only, in one flat mid tone per material. Use overlapping ellipses/blobs for organic masses (a canopy = 5-9 overlapping round blobs of different sizes; a head = one blob with brow, cheek and snout bumps), curves with taper for limbs, trunks, necks, horns, tails. No rects for living things. Check: is the silhouette readable and interesting as a solid shape?
 2. Color masses: split each material into 2-3 big areas of light and shadow (top/lit side vs underside, ambient occlusion where forms overlap or meet the ground). Big shapes, no noise.
 3. Volume: edit volume per material (colors = that material's flat tone) to turn masses into lit rounded forms; use dither 0.3-0.6 for soft materials (foliage, fur), 0 for hard ones (metal, horn). Overlapping canopy blobs drawn in slightly different mid tones get shaded as separate clumps.
-4. Detail: edit scatter for texture that follows the light (leaves on foliage, bark streaks on trunks, scales, grass, stone), density 0.4-0.8; then hand-draw focal details with draw rows/pixels: eyes as shaped clusters (lid line, pupil, 1px glint), nostrils/mouth carved into the form with shading, claws, highlights on the lit edge. Keep the most contrast and detail at the focal point (face), less elsewhere.
+4. Detail: edit scatter for texture that follows the light (leaves on foliage, bark streaks on trunks, scales, grass, stone), density 0.4-0.8; then hand-draw focal details: eyes with the eye shape (flat lower lid, angular inner corner toward the nose, upper lid arching to a round outer corner, pupil under the lid; mirror nose for the pair; at <=3px it draws tiny eyes with the glint on the light side for both), nostrils/mouth carved into the form with shading, claws, highlights on the lit edge. Keep the most contrast and detail at the focal point (face), less elsewhere.
 5. Finish: edit simplify (merge shading noise) -> outline (auto, darker neighbor color) -> selout (lighter outline on the lit side, softer inner lines) -> aa (soften stair-steps on curves) -> pixel_perfect (no doubled corners); round any region that still reads boxy. Check the palette (sprite_info palette=true) has no near-duplicate colors.
 5b. Details last: eyes, nostrils, glints, teeth, buttons go on after the finishing passes (selout and simplify would otherwise recolor or merge them). Use 3 tones per material and keep detail at the focal point; pixel art sits between simple and detailed.
 6. Review: preview at 1x and 4x. Ask: does it read at 1x? Is the light consistent? Do any straight parallel lines or perfect rectangles remain on organic forms? Fix by hand.
@@ -94,11 +94,12 @@ async function startServer() {
   const INSTRUCTIONS = `Aseprite pixel art. Coords 0-based from top-left; frames 1-based. Colors "#rgb" "#rrggbb" "#rrggbbaa" "transparent". Drawing replaces pixels.
 Resolution first: give features room (a face with readable eyes needs ~64-96px; props 16-48px). Draw bigger and display at a lower scale rather than cramming detail into few pixels.
 Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or palette ramps, 3-4 hue-shifted tones per material), one light direction. Draw, don't assemble: silhouettes from blob/curve (not rect/ellipse), S-curves and taper over straight parallel lines, asymmetry; shape features into the form (brow over eyes, snout as part of the head) instead of pasting shapes on top; eyes as small shaped clusters (lid line, pupil, 1px glint). Work in passes, one layer each, preview after every pass (prompt pixel_art_passes has the full method):
+(preview with reference=<target image> after EVERY pass, compare, and steer before continuing; when improving existing art keep its silhouette and proportions, scale it up and repaint)
 1 blockout: silhouettes from blob/ellipse/curve, flat mid color; 2 color masses: big light/shadow areas, 2-3 tones per material;
 3 volume: edit volume (forms lit from one direction, hue-shifted ramp); 4 detail: edit scatter (leaf/grass/bark/scale clusters following the light) + hand-placed details;
-5 finish: edit simplify (no noise) -> outline -> selout -> pixel_perfect, round where shapes read boxy; 6 details LAST (eyes, nostrils, glints, teeth) so passes don't alter them. Aim between simple and detailed: 3 tones per material, clean clusters, detail only at the focal point; for cute/cartoon, exaggerate (big head, big eyes with glints) and keep a solid dark outline (skip selout, which softens it). Fix by hand with read_pixels/draw rows. Use batch for many edits; separate part layers so animate can move them.`;
+5 finish: edit simplify (no noise) -> outline -> selout -> pixel_perfect, round where shapes read boxy; 6 details LAST (eyes, nostrils, glints, teeth) so passes don't alter them; draw every eye with the eye shape (anatomy when big, tiny mode at <=3px) so all glints sit on the light side. Aim between simple and detailed: 3 tones per material, clean clusters, detail only at the focal point; for cute/cartoon, exaggerate (big head, big eyes with glints) and keep a solid dark outline (skip selout, which softens it). Fix by hand with read_pixels/draw rows. Use batch for many edits; separate part layers so animate can move them.`;
 
-  const server = new McpServer({ name: "aseprite-mcp", version: "2.1.1" }, { instructions: INSTRUCTIONS });
+  const server = new McpServer({ name: "aseprite-mcp", version: "2.2.0" }, { instructions: INSTRUCTIONS });
 
   const path = z.string();
   const color = z.string();
@@ -202,6 +203,9 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
         '["blob",[[x,y],...],fill,outline?] smooth closed silhouette through points (heads, bodies, snouts); a point [x,y,1] is a sharp corner (brims, hems, ears); ' +
         '["tube",[[x,y],...],[dark..light],w0,w1?,{light?,contrast?,bias?}] shaded tapered cylinder (limbs, hair locks, horns, necks, tails; w1=0 for a point); ' +
         '["form",[[x,y(,1)],...],[dark..light],{light?,shrink?=0.18,shift?=0.5}] blob silhouette shaded with clean crescents (heads, snouts, bodies, rocks); ' +
+        '["eye",cx,cy,w,h,{fill,lid,lower?,pupil?,glint?},{nose:"right"|"left",arch?=0.4,flat?=0.7,tilt?,lidWidth?,pupil:{w,h,dx,dy},light?}] ' +
+        "an eye with anatomy: flat lower lid, angular inner corner toward the nose, upper lid arching to a round outer corner, pupil under the lid (mirror nose for the pair); " +
+        "w,h <= 3 draws a tiny eye (dark block, glint on the light side, same for both eyes). Use eye for every eye so glints agree; " +
         '["lobe",cx,cy,rx,ry,[dark..light colors],{light?,shift?=0.45,shrink?=0.2,bumps?=7,bumpiness?=0.12,seed?}] shaded form: ' +
         "each lighter tone a smaller copy shifted toward the light, scalloped clump edges (tree = ~3 lobes, back first; bushes, clouds, round bodies); " +
         'or ["gradient",x1,y1,x2,y2,[colors...],"v"|"h"|"r"] (Bayer-dithered). ' +
@@ -292,7 +296,8 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
     "preview",
     {
       description:
-        "See the sprite: zoomed, checkerboard transparency, pixel grid. frames=\"all\" contact sheet; tags=true one row per animation; tag=name.",
+        "See the sprite: zoomed, checkerboard transparency, pixel grid. frames=\"all\" contact sheet; tags=true one row per animation; tag=name. " +
+        "reference=image path (+referenceRect [x,y,w,h]) shows a target image beside it at the same height: check every pass against it.",
       inputSchema: {
         path,
         frame,
@@ -303,9 +308,12 @@ Good pixel art: small palette (presets ${Object.keys(PALETTES).join(", ")} or pa
         scale: int.optional().describe("default fits maxSize"),
         maxSize: int.optional().describe("px, default 320"),
         grid: z.boolean().optional(),
+        reference: z.string().optional(),
+        referenceRect: z.array(int).optional(),
       },
     },
-    ({ path: file, ...args }) => run(file, [], args, () => "preview"),
+    ({ path: file, reference, ...args }) =>
+      run(file, [], { ...args, ...(reference ? { reference: resolvePath(reference) } : {}) }, () => "preview"),
   );
 
   server.registerTool(

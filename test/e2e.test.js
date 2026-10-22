@@ -524,3 +524,53 @@ test("form shades any silhouette with clean crescents; simplify merges orphan pi
   assert.equal(at(18, 16), "#222244", "shadow crescent on the bottom-right");
   assert.equal(at(9, 8), "#8888ee", "light toward the top-left");
 });
+
+test("eye has anatomy (asymmetric, mirrored by nose side); preview shows a reference beside the sprite", opts, async () => {
+  const f = join(dir, "eyes.aseprite");
+  await call("batch", {
+    path: f,
+    steps: [
+      { op: "create_sprite", width: 40, height: 16 },
+      { op: "draw", shapes: [
+        ["eye", 10, 8, 14, 10, { fill: "#ffff00", lid: "#000000" }, { nose: "right" }],
+        ["eye", 30, 8, 14, 10, { fill: "#ffff00", lid: "#000000" }, { nose: "left" }],
+      ] },
+    ],
+  });
+  const g = await grid(f);
+  const cols = (x0, x1) => g.rows.map((r) => r.slice(x0, x1));
+  const left = cols(0, 20), right = cols(20, 40);
+  // mirrored pair: the right eye is the left eye flipped horizontally (within a pixel of rounding)
+  const flip = right.map((r) => [...r].reverse().join(""));
+  const same = left.reduce((n, r, y) => n + [...r].filter((c, x) => c === flip[y][x]).length, 0);
+  assert.ok(same / (20 * 16) > 0.9, `pair mirrors (${same})`);
+  // asymmetric: the eye is not its own mirror image (inner corner differs from outer corner)
+  const selfFlip = left.map((r) => [...r].reverse().join(""));
+  const selfSame = left.reduce((n, r, y) => n + [...r].filter((c, x) => c === selfFlip[y][x]).length, 0);
+  assert.ok(selfSame < same, "an eye is asymmetric");
+  const ref = join(dir, "ref.png");
+  await call("export", { path: f, output: ref, scale: 2 });
+  const p = await call("preview", { path: f, scale: 2, reference: ref });
+  const png = Buffer.from(p.content[1].data, "base64");
+  assert.ok(png.readUInt32BE(16) > 80 * 2, "preview is wider with the reference beside it");
+});
+
+test("tiny eyes keep the glint on the light side for both eyes of a pair", opts, async () => {
+  const f = join(dir, "tiny.aseprite");
+  await call("batch", {
+    path: f,
+    steps: [
+      { op: "create_sprite", width: 12, height: 4 },
+      { op: "draw", shapes: [
+        ["eye", 3, 2, 2, 2, { lid: "#000000", glint: "#ffffff" }, { nose: "right" }],
+        ["eye", 9, 2, 2, 2, { lid: "#000000", glint: "#ffffff" }, { nose: "left" }],
+      ] },
+    ],
+  });
+  const g = await grid(f);
+  const w = Object.keys(g.legend).find((c) => g.legend[c] === "#ffffff");
+  const glints = g.rows.flatMap((r, y) => [...r].map((c, x) => (c === w ? [x, y] : null)).filter(Boolean));
+  assert.equal(glints.length, 2);
+  assert.equal(glints[0][1], glints[1][1], "same row");
+  assert.equal(glints[1][0] - glints[0][0], 6, "same side of each eye (top-left light), not mirrored");
+});
